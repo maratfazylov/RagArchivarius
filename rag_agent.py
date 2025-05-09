@@ -5,7 +5,6 @@ import uuid
 import requests
 import os
 from dotenv import load_dotenv # Импортируем load_dotenv
-from llama_cpp import Llama
 
 # --- Константы (копируем или импортируем из retriever_test) ---
 QDRANT_HOST = "localhost"
@@ -18,26 +17,6 @@ GIGACHAT_SYSTEM_ROLE = """Ты — Архивариус, дружелюбный 
 Твоя задача — отвечать на вопросы пользователя, основываясь на предоставленных текстовых фрагментах из исторических документов кафедры. 
 Пожалуйста, давай точные ответы. **Всегда указывай источник информации (например, 'Источник: [имя_файла, фрагмент N]'), из которого взяты ключевые сведения для твоего ответа. Если ответ собирается из нескольких источников, укажи их все.** 
 Если информации в предоставленных фрагментах недостаточно для ответа, честно сообщи об этом."""
-
-# Глобальная переменная для модели, чтобы не загружать ее каждый раз (или сделать класс)
-LLM_QUERY_REWRITER = None
-GEMMA_MODEL_PATH = "путь/к/вашей/gemma-2b-it.Q4_K_M.gguf" # Укажите актуальный путь
-
-def initialize_query_rewriter_model(n_gpu_layers=-1): # -1 означает загрузить все слои на GPU, если возможно
-    global LLM_QUERY_REWRITER
-    if LLM_QUERY_REWRITER is None:
-        try:
-            print(f"Загрузка локальной LLM для переписывания запросов: {GEMMA_MODEL_PATH}...")
-            LLM_QUERY_REWRITER = Llama(
-                model_path=GEMMA_MODEL_PATH,
-                n_ctx=2048,        # Контекстное окно модели (можно настроить)
-                n_gpu_layers=n_gpu_layers, # Количество слоев для выгрузки на GPU
-                verbose=False      # Можно поставить True для отладки загрузки
-            )
-            print("Локальная LLM для переписывания запросов успешно загружена.")
-        except Exception as e:
-            print(f"Ошибка при загрузке локальной LLM: {e}")
-            LLM_QUERY_REWRITER = None # Явно указываем, что модель не загружена
 
 def search_qdrant_for_context(query_text: str, client: QdrantClient, embedding_model: SentenceTransformer, collection_name: str, top_k: int = 3):
     """
@@ -235,82 +214,6 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
     print("------------------------------------")
     return answer, current_user_message # Возвращаем также сообщение пользователя для добавления в историю
 
-def rewrite_query_with_gemma(user_query: str, dialog_history: list):
-    if LLM_QUERY_REWRITER is None:
-        print("Локальная LLM для переписывания не загружена. Возвращаем оригинальный запрос.")
-        return user_query
-
-    # Формируем историю для промпта Gemma
-    history_for_prompt = ""
-    # Берем, например, последние 2 обмена (4 сообщения) из dialog_history
-    # В dialog_history у нас сообщения вида {"role": "user", "content": "..."} или {"role": "assistant", "content": "..."}
-    # Формат Gemma для user/assistant может отличаться, нужно смотреть документацию модели или экспериментировать
-    # Для instruction-tuned моделей часто используется формат вроде:
-    # <start_of_turn>user
-    # {сообщение пользователя}<end_of_turn>
-    # <start_of_turn>model
-    # {сообщение ассистента}<end_of_turn>
-
-    # Упрощенный вариант формирования истории:
-    temp_history = []
-    for msg in dialog_history[-(2*2):]: # Последние 2 пары вопрос-ответ
-        if msg["role"] == "user":
-            # Пропускаем наш длинный user-контент, который содержит контекст от Qdrant,
-            # Gemma не должна его видеть для задачи переписывания.
-            # Мы должны были бы сохранять "чистый" вопрос пользователя отдельно.
-            # ПОКА ЧТО: будем использовать текущий content, но это не идеально.
-            # В будущем нужно будет передавать сюда "чистую" историю.
-            # Для Gemma instruction-tuned может быть достаточно просто "Вопрос: ... Ответ: ..."
-            if "Пожалуйста, ответь на следующий вопрос:" in msg["content"]:
-                 # Извлекаем только сам вопрос пользователя из нашего полного user-промпта
-                clean_user_q = msg["content"].split("Пожалуйста, ответь на следующий вопрос:")[-1].strip()
-                history_for_prompt += f"Пользователь: {clean_user_q}\n"
-            else: # Если это "чистый" вопрос (например, из few-shot примера)
-                history_for_prompt += f"Пользователь: {msg['content']}\n" # Неидеально
-        elif msg["role"] == "assistant":
-            history_for_prompt += f"Ассистент: {msg['content']}\n"
-    
-    # Промпт для Gemma
-    prompt_template = f"""<start_of_turn>user
-Ты — умный ассистент, который помогает улучшать поисковые запросы.
-Дана история диалога и новый вопрос пользователя.
-Твоя задача: переформулируй вопрос пользователя так, чтобы он был максимально понятным и однозначным для поиска информации в базе данных.
-Если в вопросе есть местоимения (например, "он", "его", "она"), замени их на конкретные имена или сущности из предыдущего диалога, если это уместно.
-Если вопрос уже достаточно конкретен, оставь его без изменений или сделай лишь минимальные улучшения.
-Выведи ТОЛЬКО переформулированный вопрос и ничего больше. Не добавляй никаких объяснений или преамбул.
-
-[ИСТОРИЯ ДИАЛОГА]
-{history_for_prompt}
-[ТЕКУЩИЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ]
-{user_query}
-<end_of_turn>
-<start_of_turn>model
-[ПЕРЕФОРМУЛИРОВАННЫЙ ВОПРОС ДЛЯ БАЗЫ ДАННЫХ]
-"""
-    
-    try:
-        # print(f"\n--- Промпт для Gemma (переписывание) ---\n{prompt_template}\n--------------------------------------")
-        output = LLM_QUERY_REWRITER(
-            prompt_template,
-            max_tokens=100,      # Максимальное количество токенов для ответа Gemma
-            temperature=0.2,   # Низкая температура для более детерминированного вывода
-            stop=["<end_of_turn>", "\n"] # Останавливаем генерацию на этих токенах
-        )
-        
-        rewritten_query = output["choices"][0]["text"].strip()
-        # print(f"Оригинальный запрос: {user_query}")
-        # print(f"Переписанный запрос: {rewritten_query}")
-
-        # Простая проверка, чтобы не вернуть пустую строку или что-то странное
-        if rewritten_query and len(rewritten_query) > 5: # Минимальная длина
-            return rewritten_query
-        else:
-            # print("Переписанный запрос слишком короткий или пустой, используем оригинал.")
-            return user_query
-    except Exception as e:
-        print(f"Ошибка при переписывании запроса с помощью Gemma: {e}")
-        return user_query # В случае ошибки возвращаем оригинальный запрос
-
 def main():
     load_dotenv() 
     gigachat_client_id = os.getenv("GIGACHAT_CLIENT_ID")
@@ -334,11 +237,6 @@ def main():
         print(f"Не удалось загрузить модель эмбеддингов: {e}")
         return
 
-    # Инициализация локальной LLM для переписывания запросов
-    # n_gpu_layers можно настроить в зависимости от вашей GPU
-    # -1 = все слои на GPU, 0 = только CPU, >0 = указанное количество слоев
-    initialize_query_rewriter_model(n_gpu_layers=20) # Пример для Gemma 2B, подберите значение
-
     dialog_history = [] # Инициализируем историю диалога
     # Ограничение на количество сообщений в истории (пар вопрос-ответ), чтобы не превысить лимит токенов LLM
     MAX_HISTORY_TURNS = 3 
@@ -346,54 +244,47 @@ def main():
     print("\nДобро пожаловать в Архивариус! Задавайте ваши вопросы. Для выхода введите 'выход' или 'exit'.")
 
     while True:
-        user_query_original = input("\nВы: ")
-        if user_query_original.lower() in ['выход', 'exit']:
+        user_query = input("\nВы: ")
+        if user_query.lower() in ['выход', 'exit']:
             print("До свидания!")
             break
         
-        if not user_query_original.strip():
+        if not user_query.strip():
             continue
 
-        # <<<< НОВЫЙ ШАГ: Переписывание запроса >>>>
-        print(f"\nОригинальный вопрос пользователя: {user_query_original}")
-        # Для переписывания передаем "чистую" историю, если она у нас есть.
-        # Пока что dialog_history содержит "грязные" сообщения user с контекстом.
-        # Это нужно будет улучшить - хранить чистые user-assistant пары отдельно для Gemma.
-        # Допустим, у нас есть `clean_dialog_history`
-        # cleaned_history_for_gemma = get_clean_history_for_gemma(dialog_history, MAX_HISTORY_TURNS) # Нужна функция для этого
-
-        # ПОКА ЧТО передадим текущую dialog_history, осознавая ограничения
-        rewritten_user_query = rewrite_query_with_gemma(user_query_original, dialog_history)
-        print(f"Уточненный запрос для Qdrant: {rewritten_user_query}")
-        # <<<< КОНЕЦ НОВОГО ШАГА >>>>
+        # print(f"\nПользовательский вопрос: {user_query}") # Уже выводится в input
 
         retrieved_chunks = search_qdrant_for_context(
-            query_text=rewritten_user_query, # <--- ИСПОЛЬЗУЕМ ПЕРЕПИСАННЫЙ ЗАПРОС
+            query_text=user_query, 
             client=qdrant_client, 
             embedding_model=sbert_model, 
             collection_name=COLLECTION_NAME, 
-            top_k=5 # Можно увеличить, если ретривер стал лучше
+            top_k=3 
         )
 
         context_for_llm = format_context_for_llm(retrieved_chunks)
         
+        # Передаем ограниченную историю диалога
+        # Берем последние MAX_HISTORY_TURNS * 2 сообщений (вопрос + ответ)
         limited_dialog_history = dialog_history[-(MAX_HISTORY_TURNS*2):]
 
         llm_answer, current_user_msg_for_history = ask_gigachat_with_context(
-            user_query_original, # <--- GigaChat по-прежнему получает ОРИГИНАЛЬНЫЙ вопрос
+            user_query, 
             context_for_llm, 
             GIGACHAT_SYSTEM_ROLE, 
             gigachat_client_id, 
             gigachat_client_secret,
-            limited_dialog_history
+            limited_dialog_history # Передаем ограниченную историю
         )
         
-        # Обновляем историю диалога
-        # Важно: current_user_msg_for_history сейчас содержит оригинальный user_query_original + context_for_llm
-        # Если мы хотим хранить "чистую" историю для Gemma, нужно это учесть
-        dialog_history.append(current_user_msg_for_history) 
-        if llm_answer and not llm_answer.startswith("К сожалению") and not llm_answer.startswith("Ошибка"):
+        # Добавляем текущий вопрос пользователя и ответ LLM в историю
+        dialog_history.append(current_user_msg_for_history) # Добавляем отформатированное сообщение пользователя
+        if llm_answer and not llm_answer.startswith("К сожалению") and not llm_answer.startswith("Ошибка") :
              dialog_history.append({"role": "assistant", "content": llm_answer})
+
+        # Опционально: обрезать историю, если она слишком длинная (хотя мы уже передаем limited_dialog_history)
+        # if len(dialog_history) > MAX_HISTORY_TURNS * 2 + 2: # +2 для запаса
+        #     dialog_history = dialog_history[-(MAX_HISTORY_TURNS*2):]
 
 if __name__ == "__main__":
     main() 
