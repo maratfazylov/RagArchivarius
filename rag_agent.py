@@ -1,4 +1,4 @@
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models as qdrant_models
 from sentence_transformers import SentenceTransformer
 import base64
 import uuid
@@ -41,9 +41,17 @@ def initialize_sbert_model():
         raise # Перевыбрасываем исключение
 
 # --- Основные функции RAG ---
-def search_qdrant_for_context(query_text: str, client: QdrantClient, embedding_model: SentenceTransformer, collection_name: str, top_k: int = 3):
+def search_qdrant_for_context(
+    query_text: str, 
+    client: QdrantClient, 
+    embedding_model: SentenceTransformer, 
+    collection_name: str, 
+    top_k: int = 3,
+    person_tag: str | None = None
+    ):
     """
-    Ищет контекст в Qdrant.
+    Ищет контекст в Qdrant. 
+    Если person_tag указан, фильтрует по нему.
     """
     try:
         query_embedding = embedding_model.encode(query_text)
@@ -51,10 +59,23 @@ def search_qdrant_for_context(query_text: str, client: QdrantClient, embedding_m
         print(f"Ошибка при генерации эмбеддинга для запроса: {e}")
         return []
 
+    query_filter = None
+    if person_tag:
+        print(f"Применяется фильтр по person_tag: '{person_tag}'")
+        query_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="person_tag",
+                    match=qdrant_models.MatchValue(value=person_tag)
+                )
+            ]
+        )
+
     try:
         search_results = client.search(
             collection_name=collection_name,
             query_vector=query_embedding.tolist(),
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True
         )
@@ -68,6 +89,9 @@ def format_context_for_llm(retrieved_chunks):
     Форматирует найденные чанки в строку контекста для LLM.
     """
     if not retrieved_chunks:
+        print("\n--- Контекст для LLM ---")
+        print("Контекст не найден.")
+        print("-----------------------")
         return "Контекст не найден."
     
     context_str = """Вот информация, найденная в архивах:
@@ -76,13 +100,17 @@ def format_context_for_llm(retrieved_chunks):
         source_file = hit.payload.get('source_file', 'N/A')
         chunk_index = hit.payload.get('chunk_index', 'N/A')
         text_chunk = hit.payload.get('text', 'N/A')
+        person_payload_tag = hit.payload.get('person_tag', 'N/A') 
         score = hit.score 
         context_str += f"""---
-Источник {i+1}: {source_file}, Фрагмент: {chunk_index} (Схожесть: {score:.4f})
+Источник {i+1}: {source_file} (Персона: {person_payload_tag}), Фрагмент: {chunk_index} (Схожесть: {score:.4f})
 Текст: {text_chunk}
 """
     context_str += """---
 """
+    print("\n--- Контекст для LLM ---")
+    print(context_str)
+    print("-----------------------")
     return context_str
 
 def ask_gigachat_with_context(user_question: str, context_str: str, system_role: str, client_id: str, client_secret: str, dialog_history: list):
@@ -98,7 +126,7 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
             "role": "user",
             "content": """Вот информация, найденная в архивах:
 ---
-Источник 1: Аксентьев.txt, Фрагмент: 0 (Схожесть: 0.8500)
+Источник 1: Аксентьев.txt (Персона: Аксентьев), Фрагмент: 0 (Схожесть: 0.8500)
 Текст: Леонид Александрович Аксентьев родился 1 марта 1932 года в г. Баку...
 ---
 
@@ -106,21 +134,28 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
         },
         {
             "role": "assistant",
-            "content": "Леонид Александрович Аксентьев родился 1 марта 1932 года (Источник: Аксентьев.txt, Фрагмент: 0)."
+            "content": "Леонид Александрович Аксентьев родился 1 марта 1932 года (Источник: Аксентьев.txt (Персона: Аксентьев), Фрагмент: 0)."
         },
-        # Можно добавить больше примеров, если нужно
     ]
 
     api_messages = [{"role": "system", "content": system_role}]
     api_messages.extend(few_shot_examples)
-    api_messages.extend(dialog_history)
-    api_messages.append(current_user_message)
+    api_messages.extend(dialog_history) # Добавляем предыдущие user/assistant сообщения
+    api_messages.append(current_user_message) # Добавляем текущий запрос пользователя
     
-    # Для отладки можно распечатать, что передается в GigaChat
-    # print("\n--- Сообщения для GigaChat API ---")
-    # for msg in api_messages:
-    #    print(f"- Роль: {msg['role']}, Контент: {msg['content'][:200]}...") # Выводим только начало контента
-    # print("-----------------------------------\n")
+    # --- Логгирование полного промпта для GigaChat ---
+    print("\n--- Сообщения для GigaChat API (структура) ---")
+    for i, msg in enumerate(api_messages):
+       print(f"Сообщение #{i} (Роль: {msg['role']}):")
+       # Выводим только начало длинных сообщений, чтобы не засорять лог
+       content_to_log = msg['content']
+       if len(content_to_log) > 300: # Показывать первые 150 и последние 150 символов
+           print(f"  Начало: {content_to_log[:150]}...")
+           print(f"  Конец: ...{content_to_log[-150:]}")
+       else:
+           print(f"  Контент: {content_to_log}")
+    print("----------------------------------------------\n")
+    # --- Конец логгирования --- 
 
     token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth" 
     token_payload = {'scope': 'GIGACHAT_API_PERS'} 
@@ -169,9 +204,6 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
         print(f"Ошибка при запросе к GigaChat: {e}")
         answer = "К сожалению, произошла ошибка при обращении к GigaChat."
     
-    # print("\n--- Ответ от GigaChat ---") # Для отладки
-    # print(answer)
-    # print("------------------------------------")
     return answer, current_user_message
 
 def get_rag_response(
@@ -184,30 +216,26 @@ def get_rag_response(
     system_role: str = GIGACHAT_SYSTEM_ROLE,
     collection_name: str = COLLECTION_NAME,
     top_k_retriever: int = 5,
-    max_history_turns_llm: int = 3
+    max_history_turns_llm: int = 3,
+    person_tag: str | None = None
     ):
     """
     Основная RAG-функция: получает запрос, ищет контекст, вызывает LLM.
     """
-    print(f"Получен запрос: '{user_query}'")
+    print(f"Получен запрос: '{user_query}', Фильтр по персоне: '{person_tag if person_tag else "Нет"}'")
     
-    # 1. Поиск контекста в Qdrant
-    # В этой версии мы не используем переписывание запроса, передаем user_query напрямую
     retrieved_chunks = search_qdrant_for_context(
         query_text=user_query, 
         client=qdrant_client, 
         embedding_model=sbert_model, 
         collection_name=collection_name, 
-        top_k=top_k_retriever
+        top_k=top_k_retriever,
+        person_tag=person_tag
     )
 
-    # 2. Форматирование контекста
     context_for_llm = format_context_for_llm(retrieved_chunks)
-    
-    # 3. Ограничение истории диалога для LLM
     limited_dialog_history = dialog_history[-(max_history_turns_llm*2):]
 
-    # 4. Запрос к GigaChat
     llm_answer, user_message_for_history = ask_gigachat_with_context(
         user_query, 
         context_for_llm, 
@@ -240,6 +268,11 @@ def main():
     MAX_HISTORY_TURNS_CONSOLE = 3 
 
     print("\nДобро пожаловать в Архивариус (консольная версия)! Задавайте ваши вопросы. Для выхода введите 'выход' или 'exit'.")
+    print("Для поиска по конкретной персоне, попробуйте включить ее имя в запрос, например: 'Биография Аксентьев'")
+
+    # Для простоты тестирования в консоли, определим небольшой список тегов персон вручную
+    # В боте это будет делаться динамически
+    known_person_tags_console_test = ["Аксентьев", "Шуликовский Валентин Иванович", "Чеботарев Николай Григорьевич"] # Добавьте несколько из ваших файлов
 
     while True:
         user_query_original = input("\nВы: ")
@@ -249,6 +282,15 @@ def main():
         
         if not user_query_original.strip():
             continue
+        
+        # Простая логика для извлечения тега персоны для консольного теста
+        current_person_tag_filter = None
+        for tag_candidate in known_person_tags_console_test:
+            # Ищем полное совпадение имени/тега в запросе (можно улучшить до поиска фамилии и т.д.)
+            if tag_candidate.lower() in user_query_original.lower():
+                current_person_tag_filter = tag_candidate
+                print(f"(Консольный тест: Обнаружен тег персоны '{current_person_tag_filter}' в запросе)")
+                break
 
         llm_answer, current_user_msg_for_history = get_rag_response(
             user_query=user_query_original,
@@ -257,7 +299,7 @@ def main():
             sbert_model=sbert_model,
             gigachat_client_id=gigachat_client_id,
             gigachat_client_secret=gigachat_client_secret,
-            # system_role, collection_name, top_k_retriever, max_history_turns_llm - используются значения по умолчанию
+            person_tag=current_person_tag_filter
         )
         
         dialog_history.append(current_user_msg_for_history) 

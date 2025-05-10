@@ -28,19 +28,44 @@ logger = logging.getLogger(__name__)
 # --- Глобальные переменные для RAG компонентов ---
 qdrant_client_global = None
 sbert_model_global = None
-# GIGACHAT_SYSTEM_ROLE уже определен в rag_agent.py, будем использовать его оттуда
+known_person_names_global = [] # <--- Глобальный список для имен персон
 
-def initialize_rag_components_for_bot():
-    """Инициализирует Qdrant клиент и SBERT модель один раз при старте бота."""
-    global qdrant_client_global, sbert_model_global
+def load_known_person_names(source_dir: str) -> list[str]:
+    """Сканирует директорию с текстовыми файлами и извлекает имена персон (теги)."""
+    person_names = []
+    if not os.path.exists(source_dir):
+        logger.error(f"Директория с исходными текстами '{source_dir}' не найдена для загрузки имен персон.")
+        return person_names
+    try:
+        for filename_with_ext in os.listdir(source_dir):
+            if filename_with_ext.endswith(".txt"):
+                person_tag = os.path.splitext(filename_with_ext)[0]
+                person_names.append(person_tag)
+        logger.info(f"Загружено {len(person_names)} имен персон: {person_names}")
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке имен персон из директории '{source_dir}': {e}")
+    return person_names
+
+def initialize_all_components_for_bot():
+    """Инициализирует все компоненты: RAG и список имен персон."""
+    global qdrant_client_global, sbert_model_global, known_person_names_global
     try:
         logger.info("Инициализация RAG компонентов для Telegram бота...")
         qdrant_client_global = rag_agent.initialize_qdrant_client()
         sbert_model_global = rag_agent.initialize_sbert_model()
         logger.info("RAG компоненты успешно инициализированы.")
+        
+        # Загружаем имена персон, используя TEXT_SOURCE_DIR из rag_agent, если он там определен
+        # Или можно жестко задать путь к raw_text здесь
+        # Предполагаем, что rag_agent.TEXT_SOURCE_DIR существует и указывает на правильную папку
+        # Если такого атрибута нет, нужно будет передать путь явно, например, "raw_text"
+        # Для безопасности, проверим наличие атрибута или используем константу, если она есть в telegram_bot
+        source_dir_for_names = getattr(rag_agent, 'TEXT_SOURCE_DIR', "raw_text") 
+        known_person_names_global = load_known_person_names(source_dir_for_names)
+        
         return True
     except Exception as e:
-        logger.error(f"Ошибка при инициализации RAG компонентов: {e}")
+        logger.error(f"Ошибка при полной инициализации компонентов бота: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -82,6 +107,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     current_dialog_history = user_dialog_histories[user_id]
 
+    # Определение тега персоны из запроса
+    current_person_tag_filter = None
+    if known_person_names_global: # Если список имен загружен
+        for person_name_tag in known_person_names_global:
+            # Простая проверка на вхождение (можно улучшить для более точного матчинга)
+            if person_name_tag.lower() in user_query.lower():
+                current_person_tag_filter = person_name_tag
+                logger.info(f"Обнаружен тег персоны '{current_person_tag_filter}' в запросе.")
+                break 
+
     try:
         await update.message.chat.send_action(action='typing') # Показываем, что бот печатает
         
@@ -93,6 +128,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             gigachat_client_id=GIGACHAT_CLIENT_ID,
             gigachat_client_secret=GIGACHAT_CLIENT_SECRET,
             system_role=rag_agent.GIGACHAT_SYSTEM_ROLE, # Используем роль из rag_agent
+            person_tag=current_person_tag_filter, # <--- ПЕРЕДАЕМ ТЕГ
             top_k_retriever=5, # Можно настроить
             max_history_turns_llm=MAX_HISTORY_TURNS_TELEGRAM # Используем настройку для Telegram
         )
@@ -123,8 +159,8 @@ def main_bot() -> None:
          logger.error("GIGACHAT_CLIENT_ID и/или GIGACHAT_CLIENT_SECRET не установлены в .env. Телеграм-бот не будет запущен.")
          return
 
-    if not initialize_rag_components_for_bot(): # Инициализируем компоненты при старте
-        logger.error("Не удалось инициализировать RAG компоненты. Телеграм-бот не будет запущен.")
+    if not initialize_all_components_for_bot(): # Инициализируем компоненты при старте
+        logger.error("Не удалось инициализировать компоненты бота. Телеграм-бот не будет запущен.")
         return
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
