@@ -1,10 +1,12 @@
-from qdrant_client import QdrantClient, models as qdrant_models
-from sentence_transformers import SentenceTransformer
 import base64
 import uuid
 import requests
 import os
 from dotenv import load_dotenv
+import json
+from qdrant_client import QdrantClient, models as qdrant_models
+from sentence_transformers import SentenceTransformer
+
 
 # --- Константы ---
 QDRANT_HOST = "localhost"
@@ -12,25 +14,151 @@ QDRANT_GRPC_PORT = 6334
 COLLECTION_NAME = "history_archive"
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
+# --- Новые константы для Gemma ---
+GEMMA_SERVER_IP = "192.168.1.7"  # IP-адрес вашего мощного ПК (сервера Gemma)
+GEMMA_SERVER_PORT = 8000
+GEMMA_CHAT_API_URL = f"http://{GEMMA_SERVER_IP}:{GEMMA_SERVER_PORT}/v1/chat/completions"
+
+GEMMA_PERSON_EXTRACTION_PROMPT = """Твоя задача — проанализировать запрос пользователя и выполнить две вещи:
+1. Определить, является ли запрос осмысленным вопросом для поиска информации в базе знаний или это просто светская беседа/шутка/приветствие.
+2. Если в запросе упоминается имя или фамилия личности, извлечь это имя.
+
+Верни результат в формате JSON.
+Если запрос — это осмысленный вопрос для поиска:
+  {"query_type": "question", "person_tag": "Имя Фамилия" или null, "refined_query": "исходный или немного уточненный запрос для поиска"}
+Если запрос — это светская беседа, приветствие, шутка и т.п. (не требует поиска в базе знаний):
+  {"query_type": "banter", "person_tag": null, "refined_query": "исходный запрос пользователя"}
+
+Постарайся нормализовать имя к именительному падежу, если это возможно.
+Не добавляй ничего лишнего в refined_query, если запрос и так понятен. Если личность упоминается, refined_query должен содержать эту личность.
+
+Примеры:
+Запрос: "Расскажи про Аксентьева"
+Результат: {"query_type": "question", "person_tag": "Аксентьев", "refined_query": "Расскажи про Аксентьева"}
+Запрос: "Какая биография у Николая Лобачевского?"
+Результат: {"query_type": "question", "person_tag": "Николай Лобачевский", "refined_query": "Какая биография у Николая Лобачевского?"}
+Запрос: "Что известно о вкладе Шуликовского в науку?"
+Результат: {"query_type": "question", "person_tag": "Шуликовский", "refined_query": "Что известно о вкладе Шуликовского в науку?"}
+Запрос: "Когда была основана кафедра?"
+Результат: {"query_type": "question", "person_tag": null, "refined_query": "Когда была основана кафедра?"}
+Запрос: "Привет"
+Результат: {"query_type": "banter", "person_tag": null, "refined_query": "Привет"}
+Запрос: "Как дела?"
+Результат: {"query_type": "banter", "person_tag": null, "refined_query": "Как дела?"}
+Запрос: "Спасибо!"
+Результат: {"query_type": "banter", "person_tag": null, "refined_query": "Спасибо!"}
+Запрос: "Какие научные труды есть у Аксентьева по теме X?"
+Результат: {"query_type": "question", "person_tag": "Аксентьев", "refined_query": "Какие научные труды есть у Аксентьева по теме X?"}
+Запрос: "ахаха, смешно"
+Результат: {"query_type": "banter", "person_tag": null, "refined_query": "ахаха, смешно"}
+"""
+
 # --- Настройки для GigaChat ---
-GIGACHAT_SYSTEM_ROLE = """Ты — Архивариус, дружелюбный и очень осведомленный ассистент. 
-Твоя задача — отвечать на вопросы пользователя, основываясь на предоставленных текстовых фрагментах из исторических документов кафедры. 
-Пожалуйста, давай точные ответы. **Всегда указывай источник информации (например, 'Источник: [имя_файла, фрагмент N]'), из которого взяты ключевые сведения для твоего ответа. Если ответ собирается из нескольких источников, укажи их все.** 
+GIGACHAT_SYSTEM_ROLE = """Ты — Архивариус, дружелюбный и очень осведомленный ассистент.
+Твоя задача — отвечать на вопросы пользователя, основываясь на предоставленных текстовых фрагментах из исторических документов кафедры.
+Пожалуйста, давай точные ответы. **Всегда указывай источник информации (например, 'Источник: [имя_файла, фрагмент N]'), из которого взяты ключевые сведения для твоего ответа. Если ответ собирается из нескольких источников, укажи их все.**
 Если информации в предоставленных фрагментах недостаточно для ответа, честно сообщи об этом."""
+
+# --- Функция для вызова Gemma Chat API ---
+def call_remote_gemma_chat(user_query: str, dialog_history: list = None, system_prompt: str = "Ты — полезный ИИ-ассистент."):
+    if dialog_history is None:
+        dialog_history = []
+    processed_messages = []
+    for entry in dialog_history:
+        if entry.get("role") != "system":
+            processed_messages.append({"role": entry["role"], "content": entry["content"]})
+    current_user_content = user_query
+    if system_prompt and not processed_messages:
+        current_user_content = f"{system_prompt}\n\nЗапрос пользователя:\n{user_query}"
+        print(f"(Системный промпт для Gemma '{system_prompt[:50]}...' внедрен в первый запрос пользователя)")
+    processed_messages.append({"role": "user", "content": current_user_content})
+    payload = {
+        "model": "gemma-model",
+        "messages": processed_messages,
+        "temperature": 0.2,
+        "n_predict": 300,
+        "stream": False
+    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    print(f"\nОтправка запроса к Gemma Chat API ({GEMMA_CHAT_API_URL})...")
+    try:
+        response = requests.post(GEMMA_CHAT_API_URL, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        gemma_response_data = response.json()
+        if gemma_response_data.get("choices") and \
+           len(gemma_response_data["choices"]) > 0 and \
+           gemma_response_data["choices"][0].get("message") and \
+           gemma_response_data["choices"][0]["message"].get("content"):
+            answer = gemma_response_data["choices"][0]["message"]["content"].strip()
+            print(f"\nОтвет от Gemma Chat: {answer}")
+            return answer
+        else:
+            error_detail = str(gemma_response_data)[:500]
+            print(f"Неожиданный формат ответа от Gemma Chat API: {error_detail}")
+            return f"[Ошибка Gemma Chat: Неожиданный формат ответа: {error_detail}]"
+    except requests.exceptions.Timeout:
+        print("Ошибка: Запрос к Gemma Chat API превысил время ожидания.")
+        return "[Ошибка Gemma Chat: Таймаут]"
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка при обращении к Gemma Chat API: {e}")
+        if e.response is not None:
+            print(f"Тело ответа сервера Gemma (ошибка): {e.response.text}")
+        return f"[Ошибка Gemma Chat: Подключение: {e}]"
+    except Exception as e:
+        print(f"Неизвестная ошибка при работе с Gemma Chat API: {e}")
+        return f"[Ошибка Gemma Chat: Неизвестно: {e}]"
+
+# --- Функция для извлечения тега персоны и типа запроса с помощью Gemma ---
+def get_query_details_from_gemma(user_query: str):
+    """
+    Использует Gemma для извлечения типа запроса, тега персоны и, возможно, уточнения запроса.
+    Возвращает словарь.
+    """
+    gemma_response_str = call_remote_gemma_chat(
+        user_query,
+        dialog_history=None,
+        system_prompt=GEMMA_PERSON_EXTRACTION_PROMPT
+    )
+    # Значения по умолчанию
+    default_response = {"query_type": "question", "person_tag": None, "refined_query": user_query}
+
+    if gemma_response_str and not gemma_response_str.startswith("[Ошибка"):
+        if gemma_response_str.startswith("```json"):
+            gemma_response_str = gemma_response_str.replace("```json", "").replace("```", "").strip()
+        elif gemma_response_str.startswith("```"):
+             gemma_response_str = gemma_response_str.replace("```", "").strip()
+        try:
+            parsed_response = json.loads(gemma_response_str)
+            # Проверяем наличие всех ожидаемых ключей
+            if isinstance(parsed_response, dict) and \
+               all(key in parsed_response for key in ["query_type", "person_tag", "refined_query"]):
+                print(f"Gemma извлекла: query_type='{parsed_response['query_type']}', person_tag='{parsed_response['person_tag']}', refined_query='{parsed_response['refined_query']}'")
+                if not parsed_response.get("refined_query", "").strip():
+                    parsed_response["refined_query"] = user_query
+                    print(f"Gemma вернула пустой refined_query, используем исходный: '{user_query}'")
+                return parsed_response
+            else:
+                print(f"Gemma вернула валидный JSON, но без ожидаемых ключей: {gemma_response_str}")
+                return default_response
+        except json.JSONDecodeError:
+            print(f"Не удалось распарсить JSON из ответа Gemma: {gemma_response_str}")
+            # Если не JSON, возвращаем значения по умолчанию, чтобы избежать ошибок дальше
+            return default_response
+    else:
+        print(f"Ошибка при обращении к Gemma для анализа запроса или пустой ответ: {gemma_response_str}")
+        return default_response
 
 # --- Функции инициализации ---
 def initialize_qdrant_client():
-    """Инициализирует и возвращает клиент Qdrant."""
     try:
         client = QdrantClient(host=QDRANT_HOST, grpc_port=QDRANT_GRPC_PORT, prefer_grpc=True)
         print(f"Успешное подключение к Qdrant по адресу {QDRANT_HOST}:{QDRANT_GRPC_PORT} (gRPC)")
         return client
     except Exception as e:
         print(f"Не удалось подключиться к Qdrant: {e}")
-        raise  # Перевыбрасываем исключение, чтобы вызывающий код мог его обработать
+        raise
 
 def initialize_sbert_model():
-    """Инициализирует и возвращает модель SentenceTransformer."""
     try:
         print(f"Загрузка модели эмбеддингов: {EMBEDDING_MODEL_NAME}...")
         model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
@@ -38,46 +166,29 @@ def initialize_sbert_model():
         return model
     except Exception as e:
         print(f"Не удалось загрузить модель эмбеддингов: {e}")
-        raise # Перевыбрасываем исключение
+        raise
 
 # --- Основные функции RAG ---
 def search_qdrant_for_context(
-    query_text: str, 
-    client: QdrantClient, 
-    embedding_model: SentenceTransformer, 
-    collection_name: str, 
-    top_k: int = 3,
-    person_tag: str | None = None
-    ):
-    """
-    Ищет контекст в Qdrant. 
-    Если person_tag указан, фильтрует по нему.
-    """
+    query_text: str, client: QdrantClient, embedding_model: SentenceTransformer,
+    collection_name: str, top_k: int = 3, person_tag: str | None = None ):
     try:
         query_embedding = embedding_model.encode(query_text)
     except Exception as e:
         print(f"Ошибка при генерации эмбеддинга для запроса: {e}")
         return []
-
     query_filter = None
-    if person_tag:
+    if person_tag and person_tag.strip():
         print(f"Применяется фильтр по person_tag: '{person_tag}'")
         query_filter = qdrant_models.Filter(
-            must=[
-                qdrant_models.FieldCondition(
-                    key="person_tag",
-                    match=qdrant_models.MatchValue(value=person_tag)
-                )
-            ]
+            must=[qdrant_models.FieldCondition(key="person_tag", match=qdrant_models.MatchValue(value=person_tag))]
         )
-
+    else:
+        print("Фильтр по person_tag не применяется (тег отсутствует или пустой).")
     try:
         search_results = client.search(
-            collection_name=collection_name,
-            query_vector=query_embedding.tolist(),
-            query_filter=query_filter,
-            limit=top_k,
-            with_payload=True
+            collection_name=collection_name, query_vector=query_embedding.tolist(),
+            query_filter=query_filter, limit=top_k, with_payload=True
         )
         return search_results
     except Exception as e:
@@ -85,92 +196,58 @@ def search_qdrant_for_context(
         return []
 
 def format_context_for_llm(retrieved_chunks):
-    """
-    Форматирует найденные чанки в строку контекста для LLM.
-    """
     if not retrieved_chunks:
         print("\n--- Контекст для LLM ---")
         print("Контекст не найден.")
         print("-----------------------")
         return "Контекст не найден."
-    
-    context_str = """Вот информация, найденная в архивах:
-"""
+    context_str = "Вот информация, найденная в архивах:\n"
     for i, hit in enumerate(retrieved_chunks):
         source_file = hit.payload.get('source_file', 'N/A')
         chunk_index = hit.payload.get('chunk_index', 'N/A')
         text_chunk = hit.payload.get('text', 'N/A')
-        person_payload_tag = hit.payload.get('person_tag', 'N/A') 
-        score = hit.score 
+        person_payload_tag = hit.payload.get('person_tag', 'N/A')
+        score = hit.score
         context_str += f"""---
-Источник {i+1}: {source_file} (Персона: {person_payload_tag}), Фрагмент: {chunk_index} (Схожесть: {score:.4f})
+Источник {i+1}: {source_file} (Персона в документе: {person_payload_tag}), Фрагмент: {chunk_index} (Схожесть: {score:.4f})
 Текст: {text_chunk}
 """
-    context_str += """---
-"""
+    context_str += "---\n"
     print("\n--- Контекст для LLM ---")
     print(context_str)
     print("-----------------------")
     return context_str
 
 def ask_gigachat_with_context(user_question: str, context_str: str, system_role: str, client_id: str, client_secret: str, dialog_history: list):
-    """
-    Формирует промпт для GigaChat, включая историю диалога, и вызывает API.
-    Возвращает ответ LLM и сообщение пользователя для истории.
-    """
     current_user_message_content = f"{context_str}\n\nПожалуйста, ответь на следующий вопрос: {user_question}"
     current_user_message = {"role": "user", "content": current_user_message_content}
-
     few_shot_examples = [
-        {
-            "role": "user",
-            "content": """Вот информация, найденная в архивах:
----
-Источник 1: Аксентьев.txt (Персона: Аксентьев), Фрагмент: 0 (Схожесть: 0.8500)
-Текст: Леонид Александрович Аксентьев родился 1 марта 1932 года в г. Баку...
----
-
-Пожалуйста, ответь на следующий вопрос: Когда родился Аксентьев?"""
-        },
-        {
-            "role": "assistant",
-            "content": "Леонид Александрович Аксентьев родился 1 марта 1932 года (Источник: Аксентьев.txt (Персона: Аксентьев), Фрагмент: 0)."
-        },
+        {"role": "user", "content": "Вот информация, найденная в архивах:\n---\nИсточник 1: Аксентьев.txt (Персона в документе: Аксентьев), Фрагмент: 0 (Схожесть: 0.8500)\nТекст: Леонид Александрович Аксентьев родился 1 марта 1932 года в г. Баку...\n---\n\nПожалуйста, ответь на следующий вопрос: Когда родился Аксентьев?"},
+        {"role": "assistant", "content": "Леонид Александрович Аксентьев родился 1 марта 1932 года (Источник: Аксентьев.txt (Персона в документе: Аксентьев), Фрагмент: 0)."}
     ]
-
     api_messages = [{"role": "system", "content": system_role}]
     api_messages.extend(few_shot_examples)
-    api_messages.extend(dialog_history) # Добавляем предыдущие user/assistant сообщения
-    api_messages.append(current_user_message) # Добавляем текущий запрос пользователя
-    
-    # --- Логгирование полного промпта для GigaChat ---
+    api_messages.extend(dialog_history)
+    api_messages.append(current_user_message)
     print("\n--- Сообщения для GigaChat API (структура) ---")
     for i, msg in enumerate(api_messages):
        print(f"Сообщение #{i} (Роль: {msg['role']}):")
-       # Выводим только начало длинных сообщений, чтобы не засорять лог
        content_to_log = msg['content']
-       if len(content_to_log) > 300: # Показывать первые 150 и последние 150 символов
+       if len(content_to_log) > 300:
            print(f"  Начало: {content_to_log[:150]}...")
            print(f"  Конец: ...{content_to_log[-150:]}")
        else:
            print(f"  Контент: {content_to_log}")
     print("----------------------------------------------\n")
-    # --- Конец логгирования --- 
-
-    token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth" 
-    token_payload = {'scope': 'GIGACHAT_API_PERS'} 
+    token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    token_payload = {'scope': 'GIGACHAT_API_PERS'}
     auth_string = f"{client_id}:{client_secret}"
     base64_auth_string = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-    token_headers = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Accept': 'application/json',
-      'RqUID': str(uuid.uuid4()), 
-      'Authorization': f'Basic {base64_auth_string}'
-    }
+    token_headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', 'RqUID': str(uuid.uuid4()), 'Authorization': f'Basic {base64_auth_string}'}
     access_token = None
     try:
-        response = requests.post(token_url, headers=token_headers, data=token_payload, verify=False) 
-        response.raise_for_status() 
+        response = requests.post(token_url, headers=token_headers, data=token_payload, verify=False)
+        response.raise_for_status()
         token_data = response.json()
         access_token = token_data.get("access_token")
     except requests.exceptions.RequestException as e:
@@ -178,21 +255,12 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
         return "К сожалению, не удалось получить токен для GigaChat.", current_user_message
     if not access_token:
         return "Не удалось извлечь токен доступа GigaChat.", current_user_message
-
-    chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions" 
-    chat_payload = {
-        "model": "GigaChat:latest", 
-        "messages": api_messages,
-        "temperature": 0.7, 
-    }
-    chat_headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {access_token}'
-    }
+    chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    chat_payload = {"model": "GigaChat:latest", "messages": api_messages, "temperature": 0.7}
+    chat_headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     answer = "Ошибка при обращении к GigaChat."
     try:
-        response = requests.post(chat_url, headers=chat_headers, json=chat_payload, verify=False) 
+        response = requests.post(chat_url, headers=chat_headers, json=chat_payload, verify=False)
         response.raise_for_status()
         chat_data = response.json()
         if chat_data.get("choices") and chat_data["choices"][0].get("message"):
@@ -203,113 +271,108 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
     except requests.exceptions.RequestException as e:
         print(f"Ошибка при запросе к GigaChat: {e}")
         answer = "К сожалению, произошла ошибка при обращении к GigaChat."
-    
     return answer, current_user_message
 
+# --- Обновленная функция get_rag_response ---
 def get_rag_response(
-    user_query: str, 
-    dialog_history: list,
-    qdrant_client: QdrantClient, 
-    sbert_model: SentenceTransformer,
-    gigachat_client_id: str,
-    gigachat_client_secret: str,
-    system_role: str = GIGACHAT_SYSTEM_ROLE,
-    collection_name: str = COLLECTION_NAME,
-    top_k_retriever: int = 5,
-    max_history_turns_llm: int = 3,
-    person_tag: str | None = None
-    ):
-    """
-    Основная RAG-функция: получает запрос, ищет контекст, вызывает LLM.
-    """
-    print(f"Получен запрос: '{user_query}', Фильтр по персоне: '{person_tag if person_tag else "Нет"}'")
-    
+    user_query_original: str, dialog_history: list, qdrant_client: QdrantClient,
+    sbert_model: SentenceTransformer, gigachat_client_id: str, gigachat_client_secret: str,
+    system_role_gigachat: str = GIGACHAT_SYSTEM_ROLE, collection_name: str = COLLECTION_NAME,
+    top_k_retriever: int = 5, max_history_turns_llm: int = 3 ):
+    print(f"\nПолучен оригинальный запрос от пользователя: '{user_query_original}'")
+
+    # Шаг 1: Анализ запроса с помощью Gemma
+    gemma_analysis = get_query_details_from_gemma(user_query_original)
+    query_type = gemma_analysis.get("query_type", "question") # По умолчанию - вопрос
+    person_tag_from_gemma = gemma_analysis.get("person_tag")
+    query_for_qdrant_search = gemma_analysis.get("refined_query", user_query_original).strip()
+    if not query_for_qdrant_search: # Если Gemma вернула пустой refined_query
+        query_for_qdrant_search = user_query_original
+        print("Уточненный запрос от Gemma был пустым, используем оригинальный для поиска в Qdrant.")
+
+    print(f"Тип запроса от Gemma: '{query_type}'")
+    print(f"Тег персоны от Gemma: '{person_tag_from_gemma if person_tag_from_gemma else "Нет"}'")
+    print(f"Запрос для поиска в Qdrant (от Gemma или исходный): '{query_for_qdrant_search}'")
+
+    # Шаг 1.5: Если Gemma определила запрос как "banter"
+    if query_type == "banter":
+        print("Gemma определила запрос как 'banter'. Пропускаем поиск в Qdrant и обращение к GigaChat.")
+        # Формируем user_message_for_history для "banter" случая.
+        # Контекст будет "Нет", так как мы не искали.
+        # GigaChat все равно не будет вызван, но для единообразия истории это сообщение может быть полезно.
+        banter_user_message_for_history = {
+            "role": "user",
+            "content": f"Контекст не искался (запрос типа 'banter').\n\nЗапрос пользователя: {user_query_original}"
+        }
+        # Подбираем простой ответ
+        lower_query = user_query_original.lower()
+        if "привет" in lower_query:
+            friendly_response = "Привет! Я Архивариус, готов помочь с вопросами по истории кафедры."
+        elif "как дела" in lower_query or "как ты" in lower_query:
+            friendly_response = "Все отлично, спасибо! Готов к работе. У вас есть вопросы по архивам?"
+        elif "спасибо" in lower_query or "благодарю" in lower_query:
+            friendly_response = "Пожалуйста! Рад был помочь."
+        else:
+            friendly_response = "Хорошо! Если у вас есть вопросы по архивам кафедры, спрашивайте."
+        print(f"Итоговый ответ (banter): {friendly_response}")
+        return friendly_response, banter_user_message_for_history
+
+    # Шаг 2: Поиск контекста в Qdrant (только если это "question")
     retrieved_chunks = search_qdrant_for_context(
-        query_text=user_query, 
-        client=qdrant_client, 
-        embedding_model=sbert_model, 
-        collection_name=collection_name, 
-        top_k=top_k_retriever,
-        person_tag=person_tag
+        query_text=query_for_qdrant_search, client=qdrant_client, embedding_model=sbert_model,
+        collection_name=collection_name, top_k=top_k_retriever, person_tag=person_tag_from_gemma
     )
 
+    # Шаг 3: Форматирование контекста и вызов GigaChat
     context_for_llm = format_context_for_llm(retrieved_chunks)
     limited_dialog_history = dialog_history[-(max_history_turns_llm*2):]
-
     llm_answer, user_message_for_history = ask_gigachat_with_context(
-        user_query, 
-        context_for_llm, 
-        system_role, 
-        gigachat_client_id, 
-        gigachat_client_secret,
-        limited_dialog_history
+        user_query_original, context_for_llm, system_role_gigachat,
+        gigachat_client_id, gigachat_client_secret, limited_dialog_history
     )
-    
-    print(f"Ответ LLM: {llm_answer}")
+    print(f"Итоговый ответ от GigaChat: {llm_answer}")
     return llm_answer, user_message_for_history
 
 # --- Основная функция для консольного запуска ---
 def main():
-    load_dotenv() 
+    load_dotenv()
     gigachat_client_id = os.getenv("GIGACHAT_CLIENT_ID")
     gigachat_client_secret = os.getenv("GIGACHAT_CLIENT_SECRET")
     if not gigachat_client_id or not gigachat_client_secret:
         print("Ошибка: Переменные окружения GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET не установлены.")
         return
-
     try:
         qdrant_client = initialize_qdrant_client()
         sbert_model = initialize_sbert_model()
-    except Exception as e:
-        # Сообщение об ошибке уже выведено функциями инициализации
+    except Exception:
         return
-
-    dialog_history = [] 
-    MAX_HISTORY_TURNS_CONSOLE = 3 
-
+    dialog_history = []
+    MAX_HISTORY_TURNS_CONSOLE = 3
     print("\nДобро пожаловать в Архивариус (консольная версия)! Задавайте ваши вопросы. Для выхода введите 'выход' или 'exit'.")
-    print("Для поиска по конкретной персоне, попробуйте включить ее имя в запрос, например: 'Биография Аксентьев'")
-
-    # Для простоты тестирования в консоли, определим небольшой список тегов персон вручную
-    # В боте это будет делаться динамически
-    known_person_tags_console_test = ["Аксентьев", "Шуликовский Валентин Иванович", "Чеботарев Николай Григорьевич"] # Добавьте несколько из ваших файлов
+    print("Теперь используется Gemma для автоматического определения персоны и типа запроса.")
 
     while True:
         user_query_original = input("\nВы: ")
         if user_query_original.lower() in ['выход', 'exit']:
             print("До свидания!")
             break
-        
         if not user_query_original.strip():
             continue
-        
-        # Простая логика для извлечения тега персоны для консольного теста
-        current_person_tag_filter = None
-        for tag_candidate in known_person_tags_console_test:
-            # Ищем полное совпадение имени/тега в запросе (можно улучшить до поиска фамилии и т.д.)
-            if tag_candidate.lower() in user_query_original.lower():
-                current_person_tag_filter = tag_candidate
-                print(f"(Консольный тест: Обнаружен тег персоны '{current_person_tag_filter}' в запросе)")
-                break
-
         llm_answer, current_user_msg_for_history = get_rag_response(
-            user_query=user_query_original,
-            dialog_history=dialog_history,
-            qdrant_client=qdrant_client,
-            sbert_model=sbert_model,
-            gigachat_client_id=gigachat_client_id,
-            gigachat_client_secret=gigachat_client_secret,
-            person_tag=current_person_tag_filter
+            user_query_original=user_query_original, dialog_history=dialog_history,
+            qdrant_client=qdrant_client, sbert_model=sbert_model,
+            gigachat_client_id=gigachat_client_id, gigachat_client_secret=gigachat_client_secret
         )
-        
-        dialog_history.append(current_user_msg_for_history) 
-        if llm_answer and not llm_answer.startswith("К сожалению") and not llm_answer.startswith("Ошибка"):
-             dialog_history.append({"role": "assistant", "content": llm_answer})
-        
-        # Ограничиваем историю для консольного режима
-        if len(dialog_history) > MAX_HISTORY_TURNS_CONSOLE * 2 + 2:
+        dialog_history.append(current_user_msg_for_history)
+        # Добавляем ответ ассистента в историю, только если он не является системной ошибкой
+        # "К сожалению..." и "Ошибка..." - это ответы от GigaChat при проблемах, а не от нашей логики banter
+        if llm_answer and not llm_answer.startswith("[Ошибка Gemma Chat:"): # Не добавляем ошибки Gemma в историю GigaChat
+            dialog_history.append({"role": "assistant", "content": llm_answer})
+
+        if len(dialog_history) > MAX_HISTORY_TURNS_CONSOLE * 2 + 2: # +2 для system + few-shot
             dialog_history = dialog_history[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
 
-
 if __name__ == "__main__":
-    main() 
+    print("--- Запуск RAG агента с интеграцией Gemma и GigaChat ---")
+    print(f"Попытка подключения к Gemma API: {GEMMA_CHAT_API_URL}")
+    main()
