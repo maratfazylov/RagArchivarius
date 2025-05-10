@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"  # Порт для gRPC API
+      - "6334:6334"  # Порт для HTTP REST API
+    volumes:
+      - ./qdrant_storage:/qdrant/storage # Для сохранения данных Qdrant 
