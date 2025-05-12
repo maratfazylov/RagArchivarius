@@ -22,58 +22,81 @@ LOCAL_LLM_CHAT_API_URL = f"http://{LOCAL_LLM_SERVER_IP}:{LOCAL_LLM_SERVER_PORT}/
 # Базовый промпт для анализа запроса. Список имен будет добавлен динамически.
 BASE_LOCAL_LLM_QUERY_ANALYSIS_PROMPT = """Твоя задача — проанализировать запрос пользователя и выполнить две вещи:
 1. Определить, является ли запрос осмысленным вопросом для поиска информации в базе знаний или это просто светская беседа/шутка/приветствие.
-2. Если в запросе упоминается имя или фамилия личности, извлечь это имя.
+2. Если в запросе упоминается имя или фамилия личности, извлечь это имя. Учитывай предыдущие сообщения в диалоге (если они есть) для разрешения местоимений.
 
 {known_names_section}
 
+Ключевое правило: Если фамилия из запроса пользователя (или из истории диалога) совпадает с фамилией в одном из полных имен в списке '{known_names_section}', ты **ОБЯЗАН** использовать **ПОЛНОЕ ИМЯ (Фамилия Имя Отчество) из этого списка** в поле "person_tag". Не сокращай его до одной фамилии, если в списке есть полное ФИО. Используй точное написание и порядок слов из списка.
+
+Пример:
+Список известных имен ({known_names_section}) содержит: "Лобачевский Николай Иванович", "Аксентьев Леонид Александрович".
+Запрос: "Расскажи про Лобачевского"
+Корректный person_tag: "Лобачевский Николай Иванович" (взято полное имя из списка)
+НЕПРАВИЛЬНО: "Лобачевский"
+
+Запрос: "Когда родился Аксентьев?"
+Корректный person_tag: "Аксентьев Леонид Александрович"
+НЕПРАВИЛЬНО: "Аксентьев"
+
+Если имя в запросе уже полное (например, "Иван Иванович Петров") и его нет в списке, используй его как есть.
+Если в запросе только фамилия, и этой фамилии нет в списке известных имен (или список пуст), тогда используй только эту фамилию в "person_tag".
+
 Верни результат в формате JSON.
 Если запрос — это осмысленный вопрос для поиска:
-  {{"query_type": "question", "person_tag": "Имя Фамилия" или null, "refined_query": "исходный или немного уточненный запрос для поиска"}}
-Если запрос — это светская беседа, приветствие, шутка и т.п. (не требует поиска в базе знаний):
+  {{"query_type": "question", "person_tag": "ПОЛНОЕ Имя Фамилия из списка" или "Имя как в запросе" или null, "refined_query": "исходный или немного уточненный запрос для поиска"}}
+Если запрос — это светская беседа, приветствие, шутка и т.п.:
   {{"query_type": "banter", "person_tag": null, "refined_query": "исходный запрос пользователя"}}
 
-Постарайся нормализовать имя к именительному падежу, если это возможно.
-Если ты идентифицировал личность из предоставленного списка известных имен, используй точное имя из этого списка в поле "person_tag".
-Не добавляй ничего лишнего в refined_query, если запрос и так понятен. Если личность упоминается, refined_query должен содержать эту личность.
+В поле "refined_query" старайся подставить извлеченное ПОЛНОЕ имя, если это уместно.
 
-Примеры:
-Запрос: "Расскажи про Аксентьева"
-Результат: {{"query_type": "question", "person_tag": "Аксентьев", "refined_query": "Расскажи про Аксентьева"}}
-Запрос: "Какая биография у Николая Лобачевского?"
-Результат: {{"query_type": "question", "person_tag": "Николай Лобачевский", "refined_query": "Какая биография у Николая Лобачевского?"}}
+Дополнительные примеры:
+Запрос: "Какая биография у Николая Лобачевского?" (полное имя в запросе)
+Комментарий: "Лобачевский Николай Иванович" есть в {known_names_section}.
+Результат: {{"query_type": "question", "person_tag": "Лобачевский Николай Иванович", "refined_query": "Какая биография у Лобачевского Николая Ивановича?"}}
+
 Запрос: "Что известно о вкладе Шуликовского в науку?"
-Результат: {{"query_type": "question", "person_tag": "Шуликовский", "refined_query": "Что известно о вкладе Шуликовского в науку?"}}
+Комментарий: {known_names_section} содержит "Шуликовский Владимир Игнатьевич".
+Результат: {{"query_type": "question", "person_tag": "Шуликовский Владимир Игнатьевич", "refined_query": "Что известно о вкладе Шуликовского Владимира Игнатьевича в науку?"}}
+
 Запрос: "Когда была основана кафедра?"
 Результат: {{"query_type": "question", "person_tag": null, "refined_query": "Когда была основана кафедра?"}}
+
 Запрос: "Привет"
 Результат: {{"query_type": "banter", "person_tag": null, "refined_query": "Привет"}}
-Запрос: "Как дела?"
-Результат: {{"query_type": "banter", "person_tag": null, "refined_query": "Как дела?"}}
+
+Пример с историей и выбором точного ПОЛНОГО имени из списка:
+{known_names_section} содержит: "Широков Александр Петрович", "Лобачевский Николай Иванович"
+История: [{{"role": "user", "content": "Кто такой Лобачевский?"}}, {{"role": "assistant", "content": "Это великий математик."}}]
+Запрос: "А что по поводу Широкова?"
+Результат: {{"query_type": "question", "person_tag": "Широков Александр Петрович", "refined_query": "Что известно про Широкова Александра Петровича?"}}
 """
 
 # --- Настройки для GigaChat ---
 GIGACHAT_SYSTEM_ROLE = """Ты — Архивариус, дружелюбный и очень осведомленный ассистент.
 Твоя задача — отвечать на вопросы пользователя, основываясь на предоставленных текстовых фрагментах из исторических документов кафедры.
-Пожалуйста, давай точные ответы. **Всегда указывай источник информации (например, 'Источник: [имя_файла, фрагмент N]'), из которого взяты ключевые сведения для твоего ответа. Если ответ собирается из нескольких источников, укажи их все.**
+Пожалуйста, давай точные ответы. **Всегда указывай источник информации (например, 'Источник: [имя_файла, фрагмент N]\'), из которого взяты ключевые сведения для твоего ответа. Если ответ собирается из нескольких источников, укажи их все.**
 Если информации в предоставленных фрагментах недостаточно для ответа, честно сообщи об этом."""
 
 # --- Функция для вызова локальной LLM (например, через LM Studio) ---
 def call_remote_local_llm_chat(user_query: str, dialog_history: list = None, system_prompt: str = "Ты — полезный ИИ-ассистент."):
     if dialog_history is None:
         dialog_history = []
-    processed_messages = []
-    for entry in dialog_history:
-        if entry.get("role") != "system":
-            processed_messages.append({"role": entry["role"], "content": entry["content"]})
     
-    current_user_content = user_query
-    if system_prompt and not processed_messages:
-        current_user_content = f"{system_prompt}\n\nЗапрос пользователя:\n{user_query}"
+    processed_messages = []
+    
+    # Добавляем системный промпт первым, если он есть
+    if system_prompt:
+        processed_messages.append({"role": "system", "content": system_prompt})
         log_system_prompt = system_prompt.splitlines()[0] 
         if len(log_system_prompt) > 70: log_system_prompt = log_system_prompt[:67] + "..."
-        print(f"(Системный промпт для локальной LLM '{log_system_prompt}' внедрен в первый запрос пользователя)")
+        print(f"(Системный промпт для локальной LLM '{log_system_prompt}' будет отправлен)")
+
+    # Добавляем историю диалога (без системных сообщений из истории, если они там были)
+    for entry in dialog_history:
+        if entry.get("role") != "system": # Исключаем системные сообщения из истории
+            processed_messages.append({"role": entry["role"], "content": entry["content"]})
             
-    processed_messages.append({"role": "user", "content": current_user_content})
+    processed_messages.append({"role": "user", "content": user_query}) # Текущий запрос пользователя всегда последний
     
     payload = {
         "model": "local-model", 
@@ -83,7 +106,13 @@ def call_remote_local_llm_chat(user_query: str, dialog_history: list = None, sys
         "stream": False
     }
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    print(f"\nОтправка запроса к локальной LLM ({LOCAL_LLM_CHAT_API_URL})...")
+    
+    # Логирование отправляемых сообщений для отладки
+    print(f"\nОтправка запроса к локальной LLM ({LOCAL_LLM_CHAT_API_URL}). Сообщения:")
+    for i, msg in enumerate(payload["messages"]):
+        content_preview = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
+        print(f"  #{i} Role: {msg['role']}, Content preview: {content_preview}")
+
     try:
         response = requests.post(LOCAL_LLM_CHAT_API_URL, headers=headers, json=payload, timeout=30) 
         response.raise_for_status()
@@ -113,10 +142,10 @@ def call_remote_local_llm_chat(user_query: str, dialog_history: list = None, sys
         return f"[Ошибка локальной LLM: Неизвестно: {e}]"
 
 # --- Функция для извлечения деталей запроса с помощью локальной LLM ---
-def get_query_details_from_local_llm(user_query: str, known_person_names: list = None):
+def get_query_details_from_local_llm(user_query: str, dialog_history: list = None, known_person_names: list = None):
     """
     Использует локальную LLM для извлечения типа запроса, тега персоны и, возможно, уточнения запроса.
-    Принимает список известных имен для улучшения распознавания.
+    Принимает список известных имен и историю диалога для улучшения распознавания.
     Возвращает словарь.
     """
     
@@ -128,14 +157,19 @@ def get_query_details_from_local_llm(user_query: str, known_person_names: list =
             "Если в запросе упоминается имя, похожее на одно из этих, и контекст соответствует, "
             "постарайся использовать точное имя из этого списка в поле 'person_tag'."
         )
-        print(f"Добавляем в промпт LLM секцию с известными именами ({len(known_person_names)} имен). Первые несколько: {known_person_names[:3]}")
+        print(f"Добавляем в промпт LLM секцию с известными именами ({len(known_person_names)} имен). Первые несколько: {known_person_names[:3]})")
 
-    current_system_prompt = BASE_LOCAL_LLM_QUERY_ANALYSIS_PROMPT.format(known_names_section=known_names_section_str)
+    try:
+        current_system_prompt = BASE_LOCAL_LLM_QUERY_ANALYSIS_PROMPT.format(known_names_section=known_names_section_str)
+    except KeyError as e:
+        print(f"Ошибка форматирования BASE_LOCAL_LLM_QUERY_ANALYSIS_PROMPT: {e}. Проверьте плейсхолдеры и JSON.")
+        return {"query_type": "question", "person_tag": None, "refined_query": user_query}
+
 
     llm_response_str = call_remote_local_llm_chat(
         user_query,
-        dialog_history=None, 
-        system_prompt=current_system_prompt
+        dialog_history=dialog_history, # <--- Передаем историю диалога сюда
+        system_prompt=current_system_prompt # Системный промпт с инструкциями и {known_names_section}
     )
     
     default_response = {"query_type": "question", "person_tag": None, "refined_query": user_query}
@@ -335,14 +369,18 @@ def ask_gigachat_with_context(user_question: str, context_str: str, system_role:
 def get_rag_response(
     user_query_original: str, dialog_history: list, qdrant_client: QdrantClient,
     sbert_model: SentenceTransformer, gigachat_client_id: str, gigachat_client_secret: str,
-    known_person_names_list: list = None, # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ: параметр добавлен
+    known_person_names_list: list = None,
     system_role_gigachat: str = GIGACHAT_SYSTEM_ROLE, collection_name: str = COLLECTION_NAME,
     top_k_retriever: int = 5, max_history_turns_llm: int = 3 ):
     
     print(f"\nПолучен оригинальный запрос от пользователя: '{user_query_original}'")
 
-    # Шаг 1: Анализ запроса с помощью локальной LLM, передаем список известных имен
-    llm_analysis = get_query_details_from_local_llm(user_query_original, known_person_names=known_person_names_list) 
+    # Шаг 1: Анализ запроса с помощью локальной LLM, передаем список известных имен и историю диалога
+    llm_analysis = get_query_details_from_local_llm(
+        user_query_original, 
+        dialog_history=dialog_history, # <--- Передаем историю сюда
+        known_person_names=known_person_names_list
+    ) 
     query_type = llm_analysis.get("query_type", "question") 
     person_tag_from_llm = llm_analysis.get("person_tag")
     query_for_qdrant_search = llm_analysis.get("refined_query", user_query_original).strip()
@@ -359,7 +397,7 @@ def get_rag_response(
         print("Локальная LLM определила запрос как 'banter'. Пропускаем поиск в Qdrant и обращение к GigaChat.")
         banter_user_message_for_history = {
             "role": "user",
-            "content": f"Контекст не искался (запрос типа 'banter').\n\nЗапрос пользователя: {user_query_original}"
+            "content": f"Запрос пользователя: {user_query_original}" 
         }
         lower_query = user_query_original.lower()
         if "привет" in lower_query:
@@ -380,15 +418,20 @@ def get_rag_response(
     )
 
     context_for_llm = format_context_for_llm(retrieved_chunks)
-    limited_dialog_history = dialog_history[-(max_history_turns_llm*2):] 
+    # dialog_history для GigaChat - это то, что было ДО текущего запроса пользователя
+    # user_message_for_history (возвращаемый из ask_gigachat_with_context) будет содержать ТЕКУЩИЙ запрос + контекст
+    limited_dialog_history_for_gigachat = dialog_history[-(max_history_turns_llm*2):] 
     
-    llm_answer, user_message_for_history = ask_gigachat_with_context(
+    llm_answer, user_message_for_gigachat_history = ask_gigachat_with_context(
         user_query_original, context_for_llm, system_role_gigachat,
-        gigachat_client_id, gigachat_client_secret, limited_dialog_history
+        gigachat_client_id, gigachat_client_secret, limited_dialog_history_for_gigachat
     )
     
     print(f"Итоговый ответ от GigaChat: {llm_answer}")
-    return llm_answer, user_message_for_history
+    # user_message_for_gigachat_history это то, что нужно сохранить в историю GigaChat (оно уже с контекстом)
+    # Для get_query_details_from_local_llm в следующий раз нам нужна история без этого большого контекста.
+    # Поэтому мы будем формировать dialog_history для get_query_details_from_local_llm отдельно.
+    return llm_answer, user_message_for_gigachat_history
 
 # --- Основная функция для консольного запуска ---
 def main():
@@ -400,7 +443,6 @@ def main():
         print("Ошибка: Переменные окружения GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET не установлены.")
         return
 
-    # Демонстрационный список имен. В реальном приложении лучше загружать из Qdrant.
     known_person_names_list_demo = [
         "Аксентьев Леонид Александрович", "Нужин Михаил Тихонович", "Шуликовский Владимир Игнатьевич", 
         "Чеботарев Николай Григорьевич", "Широков Александр Петрович", "Габдулхаев Билсур Габдулхаевич",
@@ -411,29 +453,27 @@ def main():
         qdrant_client = initialize_qdrant_client()
         sbert_model = initialize_sbert_model()
         
-        # Попытка загрузить имена из Qdrant, если клиент доступен
         final_known_names_list = []
-        if qdrant_client:
-            # Для консольной версии мы не можем напрямую импортировать из telegram_bot,
-            # поэтому, если нужна эта функция, ее нужно либо скопировать сюда,
-            # либо сделать частью rag_agent.py (что логичнее).
-            # Пока используем демонстрационный список.
-            # Если бы load_known_person_names_from_rag_agent_qdrant была здесь:
-            # final_known_names_list = load_known_person_names_from_rag_agent_qdrant(qdrant_client, COLLECTION_NAME)
-            pass # Заглушка, чтобы показать, где была бы загрузка
-
-        if not final_known_names_list: # Если из Qdrant не загрузилось или функция не вызывалась
+        # Загрузка имен (если реализована). Пока используем демо.
+        if not final_known_names_list: 
             print(f"Используется демонстрационный список из {len(known_person_names_list_demo)} известных имен.")
             final_known_names_list = known_person_names_list_demo
         else:
-            print(f"Загружено {len(final_known_names_list)} уникальных имен из Qdrant.")
-
+            print(f"Загружено {len(final_known_names_list)} уникальных имен.")
 
     except Exception:
         print("Не удалось инициализировать Qdrant или SBERT модель. Завершение работы.")
         return 
     
-    dialog_history = []
+    # Эта история будет передаваться в get_query_details_from_local_llm и в ask_gigachat_with_context
+    # Формат: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+    # user_message_for_gigachat_history (возвращаемый из ask_gigachat_with_context) имеет более сложный content для user.
+    # Поэтому мы будем вести две немного разные истории или адаптировать.
+    # Для простоты, dialog_history_for_llm_analysis будет содержать простые user/assistant сообщения.
+    
+    dialog_history_for_llm_analysis = [] 
+    dialog_history_for_gigachat = [] # Эта история будет содержать user сообщения с контекстом
+
     MAX_HISTORY_TURNS_CONSOLE = 3 
     
     print("\nДобро пожаловать в Архивариус (консольная версия)! Задавайте ваши вопросы. Для выхода введите 'выход' или 'exit'.")
@@ -448,27 +488,40 @@ def main():
         if not user_query_original.strip(): 
             continue
             
-        llm_answer, current_user_msg_for_history = get_rag_response(
+        # dialog_history_for_llm_analysis - это то, что пойдет в get_query_details_from_local_llm
+        # dialog_history_for_gigachat - это то, что пойдет в ask_gigachat_with_context
+        
+        llm_answer, user_message_from_gigachat_for_history = get_rag_response(
             user_query_original=user_query_original, 
-            dialog_history=dialog_history,
+            dialog_history=dialog_history_for_llm_analysis, # <--- Передаем историю для анализа запроса
             qdrant_client=qdrant_client,
             sbert_model=sbert_model,
             gigachat_client_id=gigachat_client_id, 
             gigachat_client_secret=gigachat_client_secret,
-            known_person_names_list=final_known_names_list # Передаем актуальный список
+            known_person_names_list=final_known_names_list,
+            # Передаем dialog_history_for_gigachat в get_rag_response, если GigaChat должен ее использовать
+            # Это уже сделано внутри get_rag_response через параметр dialog_history, который там копируется 
+            # и передается как limited_dialog_history_for_gigachat
         )
         
-        dialog_history.append(current_user_msg_for_history) 
-        
-        if llm_answer and not llm_answer.startswith("[Ошибка локальной LLM:") and \
-           not llm_answer.startswith("К сожалению, не удалось получить токен для GigaChat") and \
-           not llm_answer.startswith("Не удалось извлечь токен доступа GigaChat") and \
-           not llm_answer.startswith("Ошибка при обращении к GigaChat") and \
-           not llm_answer.startswith("Получен неожиданный формат ответа от GigaChat"):
-            dialog_history.append({"role": "assistant", "content": llm_answer})
+        # Обновляем историю для анализа LLM (простые сообщения)
+        dialog_history_for_llm_analysis.append({"role": "user", "content": user_query_original})
+        if llm_answer and not llm_answer.startswith("[Ошибка"): # Только если ответ не ошибка
+            dialog_history_for_llm_analysis.append({"role": "assistant", "content": llm_answer})
 
-        if len(dialog_history) > (MAX_HISTORY_TURNS_CONSOLE * 2 + 4) : 
-            dialog_history = dialog_history[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
+        # Обновляем историю для GigaChat (сообщения с контекстом от пользователя)
+        dialog_history_for_gigachat.append(user_message_from_gigachat_for_history) # Это сообщение уже имеет нужный формат
+        if llm_answer and not llm_answer.startswith("[Ошибка"): # Только если ответ не ошибка
+             dialog_history_for_gigachat.append({"role": "assistant", "content": llm_answer})
+        
+        # Ограничение обеих историй
+        if len(dialog_history_for_llm_analysis) > (MAX_HISTORY_TURNS_CONSOLE * 2) : 
+            dialog_history_for_llm_analysis = dialog_history_for_llm_analysis[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
+        
+        if len(dialog_history_for_gigachat) > (MAX_HISTORY_TURNS_CONSOLE * 2) :
+            # Здесь user_message_from_gigachat_for_history содержит "role": "user" и сложный "content"
+            # А assistant сообщение простое. Так что ограничение остается тем же.
+            dialog_history_for_gigachat = dialog_history_for_gigachat[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
 
 
 if __name__ == "__main__":
