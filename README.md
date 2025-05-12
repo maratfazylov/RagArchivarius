@@ -1,4 +1,5 @@
-# RagArchivarius# Project: RAG Archivist Bot
+# RagArchivarius
+# Project: RAG Archivist Bot
 
 ## Overview
 
