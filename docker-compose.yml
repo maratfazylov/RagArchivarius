@@ -1,9 +1,28 @@
 version: '3.8'
+
 services:
   qdrant:
     image: qdrant/qdrant:latest
+    restart: always
     ports:
-      - "6333:6333"  # Порт для gRPC API
-      - "6334:6334"  # Порт для HTTP REST API
+      - "6333:6333"  # Порт для HTTP REST API
+      - "6334:6334"  # Порт для gRPC API
     volumes:
-      - ./qdrant_storage:/qdrant/storage # Для сохранения данных Qdrant 
+      - ./qdrant_storage:/qdrant/storage # Для сохранения данных Qdrant
+
+  rag-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - LOCAL_LLM_SERVER_IP=host.docker.internal
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - qdrant
+    # Для доступа к сервисам на хост-машине из контейнера.
+    # Docker для Windows и Mac поддерживает host.docker.internal по умолчанию.
+    # Для Linux это может потребовать дополнительной настройки.
+    extra_hosts:
+      - "host.docker.internal:host-gateway" 

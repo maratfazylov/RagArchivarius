@@ -1,146 +1,148 @@
 # RagArchivarius
-# Project: RAG Archivist Bot
 
-## Overview
+## Обзор
 
-This project implements a Retrieval-Augmented Generation (RAG) system designed to answer questions about the history of a university department (or any specific domain) based on a knowledge base of historical documents. It features a Telegram bot interface for user interaction and leverages both local and cloud-based Large Language Models (LLMs) for different stages of the process.
+Этот проект представляет собой RAG-систему (Retrieval-Augmented Generation), предназначенную для ответов на вопросы по истории кафедры университета (или любой другой предметной области) на основе базы знаний из исторических документов. Он оснащен интерфейсом Telegram-бота для взаимодействия с пользователем и использует как локальные, так и облачные большие языковые модели (LLM) для различных этапов процесса.
 
-The system uses a local LLM (run via LM Studio) for initial query analysis and a powerful cloud LLM (GigaChat) to synthesize final answers based on retrieved context, complete with source citations.
+Система использует локальную LLM (запущенную через LM Studio) для первоначального анализа запросов и мощную облачную LLM (GigaChat) для синтеза окончательных ответов на основе полученного контекста, дополняя их ссылками на источники.
 
-## Features
+## Архитектура
 
-*   **Retrieval-Augmented Generation (RAG):** Answers questions using information retrieved from a document knowledge base.
-*   **Vector Database:** Utilizes Qdrant to store and search document chunks using vector embeddings.
-*   **Semantic Search:** Employs Sentence Transformers (`paraphrase-multilingual-mpnet-base-v2`) for generating embeddings and finding semantically relevant context.
-*   **Intelligent Query Analysis:** Uses a local LLM (e.g., Qwen via LM Studio) to:
-    *   Classify user input as a question requiring search (`question`) or casual chat (`banter`).
-    *   Extract personality names (`person_tag`) mentioned in the query, referencing a dynamically loaded list of known names from Qdrant.
-    *   Refine the user query for better search results.
-    *   Attempt to resolve pronouns using conversation history.
-*   **Advanced Answer Generation:** Leverages Sber's GigaChat API to generate comprehensive answers based on the retrieved context and user query.
-*   **Source Citation:** GigaChat is prompted to cite the source documents (filename, chunk index) for the information used in its answers.
-*   **Dialog History Management:** Maintains conversation context for both the query analysis LLM and the answer generation LLM.
-*   **Personality Filtering:** Filters Qdrant search results based on the `person_tag` extracted by the local LLM, improving relevance for person-specific queries.
-*   **Telegram Bot Interface:** Provides a user-friendly chat interface via Telegram (`python-telegram-bot`).
-*   **Console Interface:** Allows direct interaction with the RAG agent via the command line (`rag_agent.py`).
-*   **Configuration:** Uses a `.env` file for managing sensitive credentials (Telegram token, GigaChat API keys).
+1.  **Ввод пользователя:** Получение запроса через Telegram-бот или консоль.
+2.  **Анализ запроса (Локальная LLM):**
+    *   Запрос пользователя и недавняя история диалога отправляются в локальную LLM (через API LM Studio).
+    *   Системный промпт направляет LLM на классификацию запроса (`question`/`banter`) и извлечение `person_tag` (имени личности) с использованием динамически загружаемого списка известных имен из Qdrant.
+    *   LLM возвращает JSON-объект с полями `query_type`, `person_tag` и `refined_query`.
+3.  **(Если 'question') Векторный поиск (Qdrant):**
+    *   `refined_query` преобразуется в векторное представление (эмбеддинг).
+    *   В Qdrant выполняется поиск релевантных фрагментов документов с использованием вектора запроса.
+    *   Поиск фильтруется по `person_tag` (если он был извлечен).
+4.  **(Если 'question') Генерация ответа (GigaChat):**
+    *   Извлеченные фрагменты документов (контекст), оригинальный запрос пользователя, история диалога и системный промпт (инструктирующий GigaChat действовать как архивариус и ссылаться на источники) отправляются в GigaChat API.
+    *   GigaChat генерирует окончательный ответ.
+5.  **(Если 'banter') Прямой ответ:** Возвращается простой, заранее определенный дружелюбный ответ.
+6.  **Вывод:** Сгенерированный ответ отправляется пользователю через Telegram или в консоль.
+7.  **Обновление истории:** История диалога обновляется для следующего шага.
 
-## Architecture
+---
 
-1.  **User Input:** Received via Telegram bot or console.
-2.  **Query Analysis (Local LLM):**
-    *   The user query and recent dialog history are sent to the local LLM (via LM Studio API).
-    *   A system prompt guides the LLM to classify the query (`question`/`banter`) and extract a `person_tag` (using a list of known names loaded from Qdrant).
-    *   The LLM returns a JSON object with `query_type`, `person_tag`, and `refined_query`.
-3.  **(If 'question'): Vector Search (Qdrant):**
-    *   The `refined_query` is converted into a vector embedding.
-    *   Qdrant is searched for relevant document chunks using the query vector.
-    *   The search is filtered using the `person_tag` (if extracted).
-4.  **(If 'question'): Answer Generation (GigaChat):**
-    *   The retrieved document chunks (context), the original user query, dialog history, and a system prompt instructing GigaChat to act as an archivist and cite sources are sent to the GigaChat API.
-    *   GigaChat generates the final answer.
-5.  **(If 'banter'): Direct Response:** A simple, predefined friendly response is returned.
-6.  **Output:** The generated answer (or banter response) is sent back to the user via Telegram or console.
-7.  **History Update:** The conversation history is updated for the next turn.
+## Полное руководство по установке и запуску
 
-## Core Components
+Это пошаговое руководство поможет вам развернуть проект на вашем локальном компьютере.
 
-*   **`rag_agent.py`:** Contains the core RAG logic, including functions for interacting with the local LLM, Qdrant, GigaChat, and orchestrating the response generation flow. Can be run directly for console interaction.
-*   **`telegram_bot.py`:** Implements the Telegram bot interface, handles user sessions, initializes components, and calls `rag_agent.py`.
-*   **`qdrant_loader.py` (Assumed):** A script (not detailed here, assumed to exist or be run separately) responsible for processing source documents, generating embeddings, and loading them into the Qdrant collection with appropriate metadata (like `source_file`, `chunk_index`, `person_tag`).
-*   **Qdrant:** Vector database service. Needs to be running separately.
-*   **LM Studio:** Desktop application used to download, configure, and run the local LLM, providing an OpenAI-compatible API endpoint. Needs to be running separately with the chosen model loaded.
-*   **GigaChat API:** External cloud LLM service used for final answer generation.
+### Шаг 1: Подготовка окружения
 
-## Setup
+Вам понадобятся:
+*   **Docker Desktop:** Для запуска базы данных Qdrant и самого бота. Убедитесь, что он установлен и запущен.
+*   **Git:** Для клонирования репозитория.
+*   **Python:** Версия 3.10 или выше.
 
-1.  **Prerequisites:**
-    *   Python 3.10+
-    *   `pip` package manager
-    *   Git (optional, for cloning)
-    *   Access to a running Qdrant instance.
-    *   LM Studio installed and configured with a suitable local LLM (e.g., Qwen).
-    *   GigaChat API credentials.
-    *   Telegram Bot Token.
+### Шаг 2: Клонирование репозитория
+Откройте терминал или командную строку и выполните:
+```bash
+git clone https://github.com/maratfazylov/RagArchivarius.git
+cd RagArchivarius
+```
 
-2.  **Clone the Repository (Optional):**
-    ```bash
-    git clone <your-repo-url>
-    cd <your-repo-directory>
+### Шаг 3: Настройка переменных окружения
+
+Создайте файл `.env` в корневой папке проекта. Он будет содержать все ваши секретные ключи.
+
+1.  Скопируйте пример:
+    *   **Windows (в cmd):** `copy .env.example .env`
+    *   **Windows (в PowerShell):** `cp .env.example .env`
+    *   **Linux/macOS:** `cp .env.example .env`
+
+2.  Откройте файл `.env` и вставьте ваши реальные значения:
+    ```dotenv
+    # Токен, полученный от @BotFather в Telegram
+    TELEGRAM_BOT_TOKEN="ВАШ_ТЕЛЕГРАМ_ТОКЕН"
+
+    # Ваши учетные данные для GigaChat API
+    GIGACHAT_CLIENT_ID="ВАШ_GIGACHAT_CLIENT_ID"
+    GIGACHAT_CLIENT_SECRET="ВАШ_GIGACHAT_СЕКРЕТ"
+
+    # IP-адрес для LM Studio (обновляется на шаге 7)
+    LOCAL_LLM_SERVER_IP="127.0.0.1"
     ```
 
-3.  **Create a Virtual Environment:**
-    ```bash
-    python -m venv arch_venv
-    source arch_venv/bin/activate  # Linux/macOS
-    # OR
-    .\arch_venv\Scripts\activate  # Windows
-    ```
+### Шаг 4: Запуск базы данных Qdrant
 
-4.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Ensure you have a `requirements.txt` file listing all necessary packages: `requests`, `python-dotenv`, `qdrant-client`, `sentence-transformers`, `python-telegram-bot`, etc.)*
+В корневой папке проекта выполните команду, чтобы запустить сервис Qdrant в Docker:
+```bash
+docker-compose up -d qdrant
+```
+Эта команда скачает образ Qdrant (если его нет) и запустит его в фоновом режиме. Вы можете проверить, что он работает, открыв в браузере `http://localhost:6333/dashboard`.
 
-5.  **Configure Environment Variables:**
-    *   Create a file named `.env` in the project root.
-    *   Add the following variables:
-        ```dotenv
-        TELEGRAM_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
-        GIGACHAT_CLIENT_ID="YOUR_GIGACHAT_CLIENT_ID"
-        GIGACHAT_CLIENT_SECRET="YOUR_GIGACHAT_CLIENT_SECRET"
+### Шаг 5: Добавление документов в базу знаний
+
+Это самый важный шаг для обучения вашего бота.
+
+1.  **Подготовьте документы:**
+    *   Найдите папку `raw_text` в проекте.
+    *   Поместите в нее ваши текстовые файлы в формате `.txt`.
+    *   **Ключевое правило:** Называйте файлы по имени личности, которой они посвящены, в формате `Фамилия Имя Отчество.txt` (например, `Лобачевский Николай Иванович.txt`). Это имя будет использоваться как главный тег (`person_tag`) для фильтрации при поиске.
+
+2.  **Запустите скрипт загрузки:**
+    *   Убедитесь, что у вас установлены необходимые Python-библиотеки (если вы запускаете скрипт вне Docker):
+        ```bash
+        pip install -r requirements.txt
         ```
+    *   Выполните скрипт `load_data_to_qdrant.py`:
+        ```bash
+        python load_data_to_qdrant.py
+        ```
+    Скрипт прочитает все файлы из `raw_text`, разобьет их на фрагменты, создаст векторные представления и загрузит их в Qdrant. Вы увидите прогресс в консоли.
 
-6.  **Setup Qdrant:**
-    *   Ensure your Qdrant instance is running (e.g., via Docker).
-    *   Verify connection details (`QDRANT_HOST`, `QDRANT_GRPC_PORT` in `rag_agent.py`).
-    *   Create the collection (`COLLECTION_NAME` in `rag_agent.py`) with the correct vector parameters (matching the embedding model) and payload index for `person_tag`.
-    *   Run your data loading script (`qdrant_loader.py` or similar) to populate the Qdrant collection.
+### Шаг 6: Установка и настройка локальной LLM (LM Studio)
 
-7.  **Setup LM Studio:**
-    *   Launch LM Studio.
-    *   Download and select the desired local LLM (e.g., Qwen).
-    *   Configure the model (e.g., context length `n_ctx`). Ensure GPU acceleration is enabled if desired.
-    *   Start the local API server (using the OpenAI API format).
-    *   Note the IP address and Port of the server.
-    *   Update `LOCAL_LLM_SERVER_IP` and `LOCAL_LLM_SERVER_PORT` constants in `rag_agent.py` accordingly.
+Локальная модель нужна для анализа запросов.
 
-## Running the Bot
+1.  **Скачайте и установите** [LM Studio](https://lmstudio.ai/) для вашей операционной системы.
+2.  **Найдите и скачайте модель:**
+    *   Откройте LM Studio.
+    *   На главной странице в поиске введите `Qwen 1.5` и нажмите Enter.
+    *   В результатах найдите модель от `Qwen` (например, `Qwen/Qwen1.5-7B-Chat-GGUF`).
+    *   Справа выберите и скачайте один из квантованных файлов (например, `qwen1_5-7b-chat-q5_K_M.gguf` — хороший баланс качества и производительности).
+3.  **Запустите локальный сервер:**
+    *   Перейдите на вкладку "Local Server" (иконка `<->` слева).
+    *   Вверху в выпадающем меню "Select a model to load" выберите скачанную модель `Qwen`.
+    *   Нажмите кнопку **Start Server**.
+    *   После запуска сервера в консоли вверху найдите строки, указывающие IP-адрес и порт, которые слушает сервер (например, `http://192.168.1.5:8000`).
 
-1.  Ensure Qdrant and LM Studio (with the API server running) are active.
-2.  Activate your virtual environment.
-3.  Run the Telegram bot script:
+### Шаг 7: Запуск бота
+
+1.  **Определите IP-адрес вашего компьютера:**
+    Бот, работая в Docker, должен знать, как подключиться к LM Studio, которая запущена на вашем ПК.
+    *   **Windows:** Откройте `cmd` и введите `ipconfig`. Найдите ваш локальный IP-адрес (обычно в секции "Wireless LAN adapter Wi-Fi" или "Ethernet adapter").
+    *   **macOS/Linux:** Откройте терминал и введите `ifconfig` или `ip addr`.
+2.  **Обновите `.env` файл:**
+    *   Откройте файл `.env`.
+    *   Измените значение `LOCAL_LLM_SERVER_IP` на IP-адрес, который вы нашли на предыдущем шаге. Порт должен совпадать с тем, что в LM Studio.
+
+3.  **Запустите все вместе:**
+    Теперь, когда Qdrant запущен с данными, а сервер LM Studio работает, выполните команду для сборки и запуска вашего бота:
     ```bash
-    python telegram_bot.py
+    docker-compose up --build
     ```
-4.  Interact with your bot on Telegram.
+    Ключ `--build` пересобирает образ вашего бота, включая все последние изменения в коде.
 
-## Running the Console Version
+### Шаг 8: Проверка и остановка
 
-1.  Ensure Qdrant and LM Studio (with the API server running) are active.
-2.  Activate your virtual environment.
-3.  Run the RAG agent script directly:
+*   **Проверка логов:** Чтобы убедиться, что все работает, и отслеживать ошибки, откройте новый терминал и выполните:
     ```bash
-    python rag_agent.py
+    docker-compose logs -f rag-bot
     ```
-4.  Interact with the agent in your console.
+*   **Остановка:** Чтобы остановить все сервисы (бота и Qdrant), нажмите `Ctrl+C` в терминале, где запущен `docker-compose up`, или выполните в другом терминале:
+    ```bash
+    docker-compose down
+    ```
 
-## Configuration Summary (`.env`)
+## Потенциальные улучшения
 
-*   `TELEGRAM_BOT_TOKEN`: Your Telegram bot's unique token.
-*   `GIGACHAT_CLIENT_ID`: Your GigaChat application client ID.
-*   `GIGACHAT_CLIENT_SECRET`: Your GigaChat application client secret.
-
-*(Other configurations like Qdrant host/port, LM Studio host/port, model names, collection name are currently hardcoded as constants in `rag_agent.py` but could be moved to `.env` or a config file for more flexibility).*
-
-## Potential Improvements
-
-*   **Context Window Management:** Implement dynamic truncation or summarization of dialog history passed to LLMs to robustly handle context limits.
-*   **More Robust `person_tag` Handling:** Improve LLM prompting or add post-processing logic for more reliable extraction and normalization of person names, especially handling different orders (FIO vs IOF) or partial names.
-*   **Configuration File:** Move constants from `rag_agent.py` into a dedicated configuration file (e.g., `config.yaml`) or `.env`.
-*   **Error Handling:** Enhance error handling for API calls and component initialization.
-*   **Asynchronous Operations:** Make the Telegram bot fully asynchronous (e.g., using `asyncio` for potentially long-running LLM/Qdrant calls) to avoid blocking.
-*   **Qdrant Management Interface:** Add tools or a simple UI for easier management and inspection of the Qdrant collection.
-*   **Document Preprocessing Pipeline:** Formalize the document loading, chunking, and tagging process.
-*   **Evaluation Framework:** Implement metrics and tests to evaluate the quality of retrieval and generation.
+*   **Управление контекстным окном:** Реализовать динамическое усечение или суммирование истории диалога для LLM.
+*   **Надежная обработка `person_tag`:** Улучшить промпты или добавить логику постобработки для более надежного извлечения и нормализации имен.
+*   **Файл конфигурации:** Переместить константы из `rag_agent.py` в файл конфигурации (например, `config.yaml`) или `.env`.
+*   **Асинхронные операции:** Сделать бота полностью асинхронным, чтобы избежать блокировок при длительных вызовах LLM/Qdrant.
+*   **Конвейер предварительной обработки документов:** Формализовать процесс загрузки, разбиения на части и тегирования документов.
+*   **Фреймворк для оценки:** Внедрить метрики и тесты для оценки качества извлечения и генерации.

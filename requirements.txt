@@ -1,4 +1,8 @@
-sentence-transformers
+python-telegram-bot
+python-dotenv
+requests
 qdrant-client
-torch
-transformers 
+sentence-transformers
+transformers
+nltk
+gigachat 

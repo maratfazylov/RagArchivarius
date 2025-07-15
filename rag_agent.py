@@ -6,16 +6,18 @@ from dotenv import load_dotenv
 import json
 from qdrant_client import QdrantClient, models as qdrant_models
 from sentence_transformers import SentenceTransformer
+from gigachat import GigaChat
 
+load_dotenv()
 
 # --- Константы ---
-QDRANT_HOST = "localhost"
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_GRPC_PORT = 6334
 COLLECTION_NAME = "history_archive"
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 # --- Константы для локально запущенной LLM (через LM Studio или аналоги) ---
-LOCAL_LLM_SERVER_IP = "192.168.1.7"  # IP-адрес вашего ПК, где запущена LLM
+LOCAL_LLM_SERVER_IP = os.getenv("LOCAL_LLM_SERVER_IP", "192.168.1.7")  # IP-адрес вашего ПК, где запущена LLM
 LOCAL_LLM_SERVER_PORT = 8000
 LOCAL_LLM_CHAT_API_URL = f"http://{LOCAL_LLM_SERVER_IP}:{LOCAL_LLM_SERVER_PORT}/v1/chat/completions"
 
@@ -302,68 +304,88 @@ def format_context_for_llm(retrieved_chunks):
     return context_str
 
 def ask_gigachat_with_context(user_question: str, context_str: str, system_role: str, client_id: str, client_secret: str, dialog_history: list):
-    current_user_message_content = f"{context_str}\n\nПожалуйста, ответь на следующий вопрос: {user_question}"
-    current_user_message = {"role": "user", "content": current_user_message_content}
-    
-    few_shot_examples = [
-        {"role": "user", "content": "Вот информация, найденная в архивах:\n---\nИсточник 1: Аксентьев.txt (Персона в документе: Аксентьев), Фрагмент: 0 (Схожесть: 0.8500)\nТекст: Леонид Александрович Аксентьев родился 1 марта 1932 года в г. Баку...\n---\n\nПожалуйста, ответь на следующий вопрос: Когда родился Аксентьев?"},
-        {"role": "assistant", "content": "Леонид Александрович Аксентьев родился 1 марта 1932 года (Источник: Аксентьев.txt (Персона в документе: Аксентьев), Фрагмент: 0)."}
-    ]
-    
-    api_messages = [{"role": "system", "content": system_role}]
-    api_messages.extend(few_shot_examples) 
-    api_messages.extend(dialog_history)    
-    api_messages.append(current_user_message) 
-    
-    print("\n--- Сообщения для GigaChat API (структура) ---")
-    for i, msg in enumerate(api_messages):
-       print(f"Сообщение #{i} (Роль: {msg['role']}):")
-       content_to_log = msg['content']
-       if len(content_to_log) > 300: 
-           print(f"  Начало: {content_to_log[:150]}...")
-           print(f"  Конец: ...{content_to_log[-150:]}")
-       else:
-           print(f"  Контент: {content_to_log}")
-    print("----------------------------------------------\n")
-    
-    token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-    token_payload = {'scope': 'GIGACHAT_API_PERS'}
-    auth_string = f"{client_id}:{client_secret}"
-    base64_auth_string = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-    token_headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', 'RqUID': str(uuid.uuid4()), 'Authorization': f'Basic {base64_auth_string}'}
-    
-    access_token = None
+    """
+    Отправляет запрос в GigaChat. Сначала получает токен доступа с помощью requests,
+    затем использует этот токен с библиотекой gigachat.
+    """
     try:
-        response = requests.post(token_url, headers=token_headers, data=token_payload, verify=False) 
+        # --- Шаг 1: Получение токена доступа вручную (точно как в curl) ---
+        token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+        token_payload_str = 'scope=GIGACHAT_API_PERS'
+        
+        auth_string = f"{client_id}:{client_secret}"
+        base64_auth_string = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+        
+        token_headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json',
+            'RqUID': str(uuid.uuid4()).replace('-', ''),
+            'Authorization': f'Basic {base64_auth_string}'
+        }
+        
+        response = requests.post(token_url, headers=token_headers, data=token_payload_str, verify=False)
         response.raise_for_status()
         token_data = response.json()
         access_token = token_data.get("access_token")
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при получении токена GigaChat: {e}")
-        return "К сожалению, не удалось получить токен для GigaChat.", current_user_message
-    
-    if not access_token:
-        return "Не удалось извлечь токен доступа GigaChat.", current_user_message
+
+        if not access_token:
+            raise ValueError("Не удалось извлечь access_token из ответа.")
+
+        # --- Шаг 2: Использование полученного токена с библиотекой GigaChat ---
+        giga = GigaChat(
+            credentials=access_token, # Передаем именно токен
+            verify_ssl_certs=False
+        )
+
+        # --- Собираем весь диалог в один большой промпт-строку ---
+        full_prompt_lines = []
+
+        # 1. Системная роль (инструкция)
+        full_prompt_lines.append(system_role)
+        full_prompt_lines.append("\n" + "="*20 + "\n") # Разделитель
+
+        # 2. История диалога
+        if dialog_history:
+            full_prompt_lines.append("Предыдущий диалог:")
+            for message in dialog_history:
+                role = "Пользователь" if message["role"] == "user" else "Архивариус"
+                full_prompt_lines.append(f"{role}: {message['content']}")
+            full_prompt_lines.append("\n" + "="*20 + "\n")
+
+        # 3. Найденный в архивах контекст для текущего вопроса
+        full_prompt_lines.append(context_str)
         
-    chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-    chat_payload = {"model": "GigaChat:latest", "messages": api_messages, "temperature": 0.7} 
-    chat_headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    answer = "Ошибка при обращении к GigaChat."
-    try:
-        response = requests.post(chat_url, headers=chat_headers, json=chat_payload, verify=False) 
-        response.raise_for_status()
-        chat_data = response.json()
-        if chat_data.get("choices") and chat_data["choices"][0].get("message"):
-            answer = chat_data["choices"][0]["message"]["content"]
-        else:
-            print("Неожиданный формат ответа от GigaChat.")
-            answer = "Получен неожиданный формат ответа от GigaChat."
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при запросе к GigaChat: {e}")
-        answer = "К сожалению, произошла ошибка при обращении к GigaChat."
+        # 4. Непосредственно сам вопрос пользователя
+        full_prompt_lines.append(f"\nПожалуйста, ответь на следующий вопрос: {user_question}")
+
+        full_prompt = "\n".join(full_prompt_lines)
+
+        # Логирование для отладки
+        print("\n--- Итоговый промпт для GigaChat (одной строкой) ---")
+        print(full_prompt)
+        print("------------------------------------------------------\n")
+
+        # Отправка запроса с единым промптом
+        response = giga.chat(full_prompt)
         
-    return answer, current_user_message
+        answer = response.choices[0].message.content
+        user_message_for_history = {"role": "user", "content": user_question}
+
+        return answer, user_message_for_history
+
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP ошибка при получении токена GigaChat: {http_err}")
+        error_body = http_err.response.text
+        print(f"Тело ответа сервера: {error_body}")
+        error_message = f"Ошибка от сервера GigaChat: {error_body}"
+        user_message_for_history = {"role": "user", "content": user_question}
+        return f"К сожалению, не удалось получить токен. {error_message}", user_message_for_history
+    except Exception as e:
+        print(f"Неожиданная ошибка при работе с GigaChat: {e}")
+        error_message = f"К сожалению, произошла неожиданная ошибка при обращении к GigaChat: {e}"
+        user_message_for_history = {"role": "user", "content": user_question}
+        return error_message, user_message_for_history
+
 
 # --- Обновленная функция get_rag_response ---
 def get_rag_response(
@@ -422,20 +444,19 @@ def get_rag_response(
     # user_message_for_history (возвращаемый из ask_gigachat_with_context) будет содержать ТЕКУЩИЙ запрос + контекст
     limited_dialog_history_for_gigachat = dialog_history[-(max_history_turns_llm*2):] 
     
-    llm_answer, user_message_for_gigachat_history = ask_gigachat_with_context(
+    llm_answer, user_message_from_gigachat_for_history = ask_gigachat_with_context(
         user_query_original, context_for_llm, system_role_gigachat,
         gigachat_client_id, gigachat_client_secret, limited_dialog_history_for_gigachat
     )
     
     print(f"Итоговый ответ от GigaChat: {llm_answer}")
-    # user_message_for_gigachat_history это то, что нужно сохранить в историю GigaChat (оно уже с контекстом)
-    # Для get_query_details_from_local_llm в следующий раз нам нужна история без этого большого контекста.
-    # Поэтому мы будем формировать dialog_history для get_query_details_from_local_llm отдельно.
-    return llm_answer, user_message_for_gigachat_history
+    
+    # ВАЖНО: user_message_from_gigachat_for_history теперь содержит чистый вопрос пользователя,
+    # а не сложный промпт с контекстом. Это упрощает ведение истории.
+    return llm_answer, user_message_from_gigachat_for_history
 
 # --- Основная функция для консольного запуска ---
 def main():
-    load_dotenv()
     gigachat_client_id = os.getenv("GIGACHAT_CLIENT_ID")
     gigachat_client_secret = os.getenv("GIGACHAT_CLIENT_SECRET")
 
@@ -488,30 +509,25 @@ def main():
         if not user_query_original.strip(): 
             continue
             
-        # dialog_history_for_llm_analysis - это то, что пойдет в get_query_details_from_local_llm
-        # dialog_history_for_gigachat - это то, что пойдет в ask_gigachat_with_context
-        
         llm_answer, user_message_from_gigachat_for_history = get_rag_response(
             user_query_original=user_query_original, 
-            dialog_history=dialog_history_for_llm_analysis, # <--- Передаем историю для анализа запроса
+            dialog_history=dialog_history_for_llm_analysis, 
             qdrant_client=qdrant_client,
             sbert_model=sbert_model,
             gigachat_client_id=gigachat_client_id, 
             gigachat_client_secret=gigachat_client_secret,
             known_person_names_list=final_known_names_list,
-            # Передаем dialog_history_for_gigachat в get_rag_response, если GigaChat должен ее использовать
-            # Это уже сделано внутри get_rag_response через параметр dialog_history, который там копируется 
-            # и передается как limited_dialog_history_for_gigachat
         )
         
         # Обновляем историю для анализа LLM (простые сообщения)
         dialog_history_for_llm_analysis.append({"role": "user", "content": user_query_original})
-        if llm_answer and not llm_answer.startswith("[Ошибка"): # Только если ответ не ошибка
+        if llm_answer and not llm_answer.startswith("[Ошибка") and not llm_answer.startswith("К сожалению"):
             dialog_history_for_llm_analysis.append({"role": "assistant", "content": llm_answer})
 
-        # Обновляем историю для GigaChat (сообщения с контекстом от пользователя)
-        dialog_history_for_gigachat.append(user_message_from_gigachat_for_history) # Это сообщение уже имеет нужный формат
-        if llm_answer and not llm_answer.startswith("[Ошибка"): # Только если ответ не ошибка
+        # Обновляем историю для GigaChat (теперь она тоже содержит простые сообщения)
+        # user_message_from_gigachat_for_history теперь это просто `{"role": "user", "content": user_query_original}`
+        dialog_history_for_gigachat.append(user_message_from_gigachat_for_history) 
+        if llm_answer and not llm_answer.startswith("[Ошибка") and not llm_answer.startswith("К сожалению"):
              dialog_history_for_gigachat.append({"role": "assistant", "content": llm_answer})
         
         # Ограничение обеих историй
@@ -519,8 +535,6 @@ def main():
             dialog_history_for_llm_analysis = dialog_history_for_llm_analysis[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
         
         if len(dialog_history_for_gigachat) > (MAX_HISTORY_TURNS_CONSOLE * 2) :
-            # Здесь user_message_from_gigachat_for_history содержит "role": "user" и сложный "content"
-            # А assistant сообщение простое. Так что ограничение остается тем же.
             dialog_history_for_gigachat = dialog_history_for_gigachat[-(MAX_HISTORY_TURNS_CONSOLE * 2):]
 
 
